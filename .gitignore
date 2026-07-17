@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+RAG/
+.venv/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+
+# Private knowledge and generated indexes
+data/
+chroma_db*/
+.secondbrain_manifest.json
+*.sqlite
+*.sqlite3
+
+# Runtime output
+*.log
+*.err
+*.out
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Evaluation reports
+evaluation_report.json
