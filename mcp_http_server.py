@@ -256,8 +256,12 @@ async def sse_messages(
 @app.post("/sse")
 async def sse_messages_alias(
     request: Request,
-    session_id: str = Query(..., alias="sessionId"),
+    session_id: Optional[str] = Query(default=None, alias="sessionId"),
 ):
+    # Keep `/sse` compatible with clients that incorrectly/legacy-configured
+    # the endpoint but actually speak streamable HTTP via POST.
+    if session_id is None:
+        return await mcp_post(request)
     return await sse_messages(request, session_id)
 
 

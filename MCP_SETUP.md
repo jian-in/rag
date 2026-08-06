@@ -7,7 +7,8 @@ This project now provides two MCP entrypoints:
 - `mcp_http_server.py`: recommended, more compatible with desktop clients
 - `mcp_server.py`: stdio fallback
 
-For this project, the stable choice is usually HTTP/SSE instead of stdio.
+For current Codex desktop clients, use streamable HTTP at `/mcp`; older SSE-only
+clients should use `/sse` instead.
 
 ## Recommended Setup
 
@@ -24,19 +25,20 @@ If `8766` is already occupied, change it to another free port such as `8767`.
 
 ### 2. Configure the MCP client
 
-If the client uses SSE handshake, use:
-
-```text
-rag-kb=http://127.0.0.1:8766/sse
-```
-
-If the client explicitly supports streamable HTTP MCP, you can also try:
+For current Codex desktop clients, use streamable HTTP:
 
 ```text
 rag-kb=http://127.0.0.1:8766/mcp
 ```
 
-In this project, `/sse` is the safest default for desktop MCP clients.
+For an older client that explicitly uses an SSE handshake, use:
+
+```text
+rag-kb=http://127.0.0.1:8766/sse
+```
+
+Do not point a streamable HTTP client at `/sse`: it will send POST requests
+without `sessionId` and receive HTTP 422.
 
 ## Available Tools
 
@@ -89,7 +91,7 @@ Recommended fix:
 
 1. Stop using stdio for this client.
 2. Start `mcp_http_server.py` instead.
-3. Configure the client with `http://127.0.0.1:8766/sse`.
+3. Configure the client with `http://127.0.0.1:8766/mcp`.
 
 ### `405 Method Not Allowed`
 
@@ -144,8 +146,8 @@ A healthy response looks like:
 ## Lessons Learned
 
 - MCP transport compatibility matters as much as tool logic.
-- Desktop clients often behave better with HTTP/SSE than with stdio.
-- If the client says `SSE handshake`, prefer `/sse`.
+- Current Codex desktop clients use streamable HTTP at `/mcp`.
+- If a client explicitly says `SSE handshake`, use `/sse` for that client.
 - Always separate these two questions first:
   - Did the server start?
   - Did the client and server agree on the transport format?
@@ -154,5 +156,5 @@ A healthy response looks like:
 ## Notes
 
 - Build the knowledge base before using MCP, so `chroma_db/` already exists.
-- The server reload path rebuilds BM25 from `data/` and loads vectors from `chroma_db/`.
+- The server reload path rebuilds BM25 and vector retrieval from the final Chroma collection.
 - The MCP servers reuse the existing RAG stack, including hybrid retrieval and reranking.
