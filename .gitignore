@@ -44,3 +44,5 @@ Thumbs.db
 
 # Evaluation reports
 evaluation_report.json
+.secondbrain_sync_manifest.json
+.rag_vector_manifest.json

@@ -151,6 +151,33 @@ class VectorStoreManager:
             )
         return self.vectorstore
 
+    def get_snapshot(self) -> dict:
+        """Return document IDs, text, and metadata for index synchronization."""
+        if self.vectorstore is None:
+            raise RuntimeError("向量数据库未初始化")
+        return self.vectorstore._collection.get(
+            include=["documents", "metadatas"]
+        )
+
+    def add_documents_with_ids(self, documents: List[Document], ids: List[str]) -> None:
+        """Add documents with deterministic IDs for idempotent synchronization."""
+        if self.vectorstore is None:
+            raise RuntimeError("向量数据库未初始化")
+        self.vectorstore.add_documents(documents, ids=ids)
+
+    def delete_ids(self, ids: List[str]) -> None:
+        """Delete specific vector IDs without exposing Chroma to callers."""
+        if self.vectorstore is None:
+            raise RuntimeError("向量数据库未初始化")
+        if ids:
+            self.vectorstore._collection.delete(ids=ids)
+
+    def count(self) -> int:
+        """Return the current vector count."""
+        if self.vectorstore is None:
+            raise RuntimeError("向量数据库未初始化")
+        return self.vectorstore._collection.count()
+
     def get_stats(self) -> dict:
         """
         获取向量数据库的统计信息

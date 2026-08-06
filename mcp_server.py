@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,8 +18,14 @@ if str(ROOT) not in sys.path:
 
 import config
 from chain.qa_chain import QAChain
+from ingestion.incremental_sync import (
+    DEFAULT_INCLUDE_DIRS,
+    DEFAULT_SOURCE_ROOT,
+    sync_secondbrain,
+)
 from ingestion.loader import DocumentLoader
 from ingestion.splitter import TextSplitter
+from langchain_core.documents import Document
 from retrieval.hybrid_retriever import BM25Retriever, HybridRetriever
 from retrieval.reranker import Reranker
 from retrieval.retriever import SmartRetriever
@@ -27,7 +34,7 @@ from vectorstore.store import VectorStoreManager
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "rag-knowledge-base"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -66,30 +73,30 @@ class KnowledgeRuntime:
         self.qa_chain: Optional[QAChain] = None
         self.doc_count = 0
         self.vector_count = 0
+        self.sync_lock = threading.Lock()
 
-    def ensure_loaded(self) -> None:
-        if self.loaded:
-            return
+    def _load_chunks_from_vectorstore(
+        self,
+        manager: VectorStoreManager,
+    ) -> List[Document]:
+        result = manager.get_snapshot()
+        documents = result.get("documents", []) or []
+        metadatas = result.get("metadatas", []) or []
+        chunks: List[Document] = []
+        for index, content in enumerate(documents):
+            if not content:
+                continue
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            chunks.append(Document(page_content=content, metadata=metadata or {}))
+        return chunks
 
-        chroma_dir = (ROOT / config.CHROMA_PERSIST_DIR).resolve()
-        data_dir = (ROOT / "data").resolve()
-
-        if not chroma_dir.exists():
-            raise MCPError(
-                f"Vector index not found at {chroma_dir}. Build the knowledge base first."
-            )
-
-        if not data_dir.exists():
-            raise MCPError(f"Data directory not found at {data_dir}.")
-
+    def _initialize_from_vectorstore(
+        self,
+        manager: VectorStoreManager,
+    ) -> None:
+        vectorstore = manager.get_vectorstore()
         with redirect_stdout_to_stderr():
-            loader = DocumentLoader()
-            splitter = TextSplitter()
-            docs = loader.load_directory(str(data_dir))
-            chunks = splitter.split_documents(docs)
-
-            manager = VectorStoreManager(persist_dir=str(chroma_dir))
-            vectorstore = manager.load()
+            chunks = self._load_chunks_from_vectorstore(manager)
 
             reranker = None
             warning = None
@@ -116,9 +123,28 @@ class KnowledgeRuntime:
         self.hybrid_retriever = hybrid
         self.qa_chain = qa_chain
         self.doc_count = len(chunks)
-        self.vector_count = vectorstore._collection.count()
+        self.vector_count = manager.count()
         self.load_warning = warning
         self.loaded = True
+
+    def ensure_loaded(self) -> None:
+        if self.loaded:
+            return
+
+        chroma_dir = (ROOT / config.CHROMA_PERSIST_DIR).resolve()
+        data_dir = (ROOT / "data").resolve()
+
+        if not chroma_dir.exists():
+            raise MCPError(
+                f"Vector index not found at {chroma_dir}. Build the knowledge base first."
+            )
+
+        if not data_dir.exists():
+            raise MCPError(f"Data directory not found at {data_dir}.")
+
+        manager = VectorStoreManager(persist_dir=str(chroma_dir))
+        manager.load()
+        self._initialize_from_vectorstore(manager)
 
     def reload(self) -> Dict[str, Any]:
         self.loaded = False
@@ -131,6 +157,33 @@ class KnowledgeRuntime:
         self.vector_count = 0
         self.ensure_loaded()
         return self.status()
+
+    def sync(self) -> Dict[str, Any]:
+        """Mirror SecondBrain and incrementally update vectors and BM25."""
+        with self.sync_lock:
+            self.ensure_loaded()
+            assert self.vectorstore_manager is not None
+            data_dir = (ROOT / "data").resolve()
+
+            try:
+                with redirect_stdout_to_stderr():
+                    result = sync_secondbrain(
+                        vectorstore=self.vectorstore_manager,
+                        source_root=DEFAULT_SOURCE_ROOT,
+                        mirror_root=data_dir,
+                        include_dirs=DEFAULT_INCLUDE_DIRS,
+                        loader=DocumentLoader(),
+                        splitter=TextSplitter(),
+                        mirror_manifest_path=ROOT / ".secondbrain_sync_manifest.json",
+                        vector_manifest_path=ROOT / ".rag_vector_manifest.json",
+                    )
+            finally:
+                # Rebuild both retrievers from the final Chroma snapshot even when
+                # a source file reports an individual parse/write error.
+                self._initialize_from_vectorstore(self.vectorstore_manager)
+
+            result["status"] = self.status()
+            return result
 
     def status(self) -> Dict[str, Any]:
         chroma_dir = (ROOT / config.CHROMA_PERSIST_DIR).resolve()
@@ -147,6 +200,8 @@ class KnowledgeRuntime:
             "reranker_enabled": bool(config.ENABLE_RERANKER),
             "reranker_provider": config.RERANKER_PROVIDER,
             "reranker_model": config.RERANKER_MODEL_NAME,
+            "source_root": str(DEFAULT_SOURCE_ROOT),
+            "source_include_dirs": list(DEFAULT_INCLUDE_DIRS),
             "warning": self.load_warning,
         }
 
@@ -300,6 +355,15 @@ class MCPServer:
                 },
             },
             {
+                "name": "sync_knowledge_base",
+                "description": "Mirror selected SecondBrain folders and incrementally synchronize added, changed, and deleted files into Chroma and BM25.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            {
                 "name": "search_knowledge",
                 "description": "Search the local RAG knowledge base. Use this when the user asks for facts from the configured documents.",
                 "inputSchema": {
@@ -446,6 +510,8 @@ class MCPServer:
             return self._tool_response(self.runtime.status())
         if name == "reload_knowledge_base":
             return self._tool_response(self.runtime.reload())
+        if name == "sync_knowledge_base":
+            return self._tool_response(self.runtime.sync())
         if name == "search_knowledge":
             query = arguments.get("query")
             if not query:

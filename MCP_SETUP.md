@@ -41,9 +41,33 @@ In this project, `/sse` is the safest default for desktop MCP clients.
 ## Available Tools
 
 - `get_status`: show index and model status
+- `sync_knowledge_base`: mirror selected SecondBrain folders and incrementally synchronize files, vectors, and BM25
 - `reload_knowledge_base`: reload Chroma and rebuild BM25 from `data/`
 - `search_knowledge`: return relevant chunks
 - `ask_knowledge`: answer with citations from the local knowledge base
+
+## Add or Update SecondBrain Notes
+
+The default source is `C:\Desktop\SecondBrain`. The sync tool watches these folders:
+
+- `02-Areas`
+- `03-Resources`
+
+Put or edit supported files there (`.md`, `.txt`, `.pdf`, `.docx`), then call the MCP tool
+`sync_knowledge_base`. It mirrors the selected folders into `data/`, calculates file
+fingerprints, and only embeds added or changed files. Deleted source files have their
+mirrored copy and vectors removed. A parse or copy failure keeps the previous vector
+instead of deleting it.
+
+`00-Inbox` is intentionally excluded by default so unfinished captures do not enter
+the answerable knowledge base. To include it, set:
+
+```powershell
+$env:SECONDBRAIN_INCLUDE_DIRS="02-Areas,03-Resources,00-Inbox"
+```
+
+The sync manifests are `.secondbrain_sync_manifest.json` and
+`.rag_vector_manifest.json`; they are local runtime state and should not be edited by hand.
 
 ## Stdio Fallback
 

@@ -99,3 +99,13 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
 # 评估配置
 # ============================================================
 EVAL_DATASET_PATH = os.getenv("EVAL_DATASET_PATH", "./data/eval_dataset.json")
+
+# ============================================================
+# SecondBrain 增量同步配置
+# ============================================================
+SECONDBRAIN_ROOT = os.getenv("SECONDBRAIN_ROOT", r"C:\Desktop\SecondBrain")
+SECONDBRAIN_INCLUDE_DIRS = tuple(
+    item.strip()
+    for item in os.getenv("SECONDBRAIN_INCLUDE_DIRS", "02-Areas,03-Resources").split(",")
+    if item.strip()
+)
