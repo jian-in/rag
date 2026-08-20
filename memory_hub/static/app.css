@@ -184,7 +184,7 @@ h2 { margin-bottom: 8px; font-weight: 500; letter-spacing: .035em; }
 .card-metric span, .memory-card small { color: var(--muted); font: 11px/1.4 var(--mono); }
 .memory-card small { display: block; margin-top: 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.console-panel, .results-panel, .context-panel {
+.console-panel, .results-panel, .context-panel, .review-panel {
   background: var(--panel);
   border: 1px solid var(--line);
   box-shadow: var(--shadow);
@@ -243,6 +243,51 @@ button:disabled { opacity: .35; cursor: not-allowed; transform: none !important;
 
 .workbench { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(330px, .65fr); gap: 14px; margin-top: 14px; }
 .results-panel, .context-panel { min-height: 390px; padding: 24px 26px; }
+.review-panel { margin-top: 14px; padding: 24px 26px; }
+.review-heading { align-items: flex-end; }
+.review-intro { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+.review-toolbar { display: flex; gap: 8px; align-items: center; padding: 15px 0; border-bottom: 1px solid var(--line); }
+.review-filter, .approve-button, .danger-button {
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: rgba(4, 14, 12, .42);
+  font: 11px/1 var(--mono);
+  cursor: pointer;
+}
+.review-filter.active { color: var(--ink); border-color: var(--mint); background: var(--mint); }
+.review-refresh { margin-left: auto; }
+.review-list { display: grid; gap: 11px; padding-top: 16px; }
+.review-empty { min-height: 120px; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+.candidate-card {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 12px 16px;
+  padding: 17px;
+  border: 1px solid rgba(191,224,204,.14);
+  border-left: 3px solid var(--gold);
+  background: rgba(3,13,11,.34);
+}
+.candidate-card.status-approved { border-left-color: var(--mint); }
+.candidate-card.status-rejected, .candidate-card.status-forgotten { border-left-color: rgba(155,174,165,.4); }
+.candidate-meta { grid-column: 1 / -1; display: flex; gap: 14px; color: var(--muted); font: 10px/1.4 var(--mono); }
+.candidate-scope, .candidate-content, .candidate-note {
+  color: var(--paper);
+  border: 1px solid var(--line);
+  background: rgba(2, 10, 9, .58);
+  outline: 0;
+}
+.candidate-scope { align-self: start; padding: 10px; font: 11px/1.2 var(--mono); }
+.candidate-content { width: 100%; resize: vertical; padding: 11px 13px; font: 13px/1.65 var(--serif); }
+.candidate-content:focus, .candidate-note:focus, .candidate-scope:focus { border-color: rgba(86,216,189,.52); }
+.candidate-content:disabled, .candidate-scope:disabled { opacity: .78; }
+.candidate-reason { grid-column: 2; margin: -2px 0 0; color: var(--muted); font-size: 11px; }
+.candidate-controls { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
+.candidate-note { min-width: 260px; margin-right: auto; padding: 8px 10px; font: 11px/1 var(--mono); }
+.approve-button { color: var(--ink); border-color: var(--mint); background: var(--mint); }
+.approve-button:hover { background: #7ae4ce; }
+.danger-button { color: #ff9d87; border-color: rgba(255,118,88,.34); }
+.danger-button:hover { color: var(--paper); background: rgba(255,118,88,.15); }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
 .section-heading h2 { margin: 0; font-size: 22px; }
 .section-heading.compact { padding-bottom: 14px; }
@@ -326,7 +371,12 @@ button:disabled { opacity: .35; cursor: not-allowed; transform: none !important;
   .scope-row { align-items: stretch; flex-direction: column; }
   fieldset { flex-wrap: wrap; }
   .actions { flex-wrap: wrap; }
-  .results-panel, .context-panel, .console-panel { padding: 19px; }
+  .results-panel, .context-panel, .console-panel, .review-panel { padding: 19px; }
+  .review-toolbar, .candidate-controls { flex-wrap: wrap; }
+  .review-refresh { margin-left: 0; }
+  .candidate-card { grid-template-columns: 1fr; }
+  .candidate-meta, .candidate-reason, .candidate-controls { grid-column: 1; }
+  .candidate-note { width: 100%; min-width: 0; margin-right: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

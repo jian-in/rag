@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 - 2026-08-20
+
+- Added Codex native prompt and stop hooks for automatic local recall.
+- Added review-only candidate proposals with secret filtering and ephemeral turn spooling.
+- Documented the human approval, correction, rejection, and precise-forget boundary.
+
 ## 1.0.0 - 2026-08-20
 
 - Added automatic and explicit activation guidance for personal continuity tasks.

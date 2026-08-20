@@ -33,7 +33,8 @@ an optional external embedding provider may be configured later by the service o
 Agents with MCP support should call `memory_context`. It returns a compact prompt-ready
 string plus structured hits. `memory_search` is useful when the Agent needs to inspect
 several locators before deciding what to include. `memory_status` checks readiness, and
-`memory_sync` refreshes one or more indexes.
+`memory_sync` refreshes one or more indexes. `memory_propose` can submit a candidate, but
+it deliberately cannot approve or mutate a source file.
 
 The server advertises its entry document at:
 
@@ -75,6 +76,18 @@ Refresh only changed source domains:
 ```bash
 python scripts/memory_client.py sync --scopes profile episodes
 ```
+
+Submit an explicit, review-only candidate:
+
+```bash
+python scripts/memory_client.py propose "阿飞偏好可审计的自动化" \
+  --scope profile --reason "用户明确表达稳定偏好"
+```
+
+Review, correct, approve, reject, or forget candidates in the independent dashboard.
+Approved blocks carry a candidate marker; forgetting removes only that managed block.
+The `vault` target is limited to `00-Inbox/Agent Memory Inbox.md` and does not broaden
+the rest of the Obsidian allowlist.
 
 ## Interpreting results
 

@@ -92,6 +92,22 @@ class MemoryMCP:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "memory_propose",
+                "description": "Submit a possible personal memory for local human review. This never writes directly to the memory sources.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {"type": "string", "enum": list(MEMORY_SCOPES)},
+                        "content": {"type": "string", "minLength": 3, "maxLength": 4000},
+                        "reason": {"type": "string", "maxLength": 1000},
+                        "source": {"type": "string", "maxLength": 200},
+                        "session_id": {"type": "string", "maxLength": 200},
+                    },
+                    "required": ["scope", "content"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -125,24 +141,40 @@ class MemoryMCP:
                 top_k=int(arguments.get("top_k", 8)),
                 char_budget=int(arguments.get("char_budget", 6000)),
             )
+        if name == "memory_propose":
+            scope = str(arguments.get("scope", "")).strip()
+            content = str(arguments.get("content", "")).strip()
+            if not scope or not content:
+                raise MemoryMCPError("scope and content are required")
+            return self.hub.propose_memory(
+                scope=scope,
+                content=content,
+                reason=str(arguments.get("reason", "")),
+                source=str(arguments.get("source", "agent")),
+                session_id=(
+                    str(arguments["session_id"])
+                    if arguments.get("session_id") is not None
+                    else None
+                ),
+            )
         raise MemoryMCPError(f"unknown memory tool: {name}")
 
 
 def create_app(hub: MemoryHub) -> FastAPI:
     tools = MemoryMCP(hub)
-    app = FastAPI(title="Feili Personal Memory Hub", version="0.1.0")
+    app = FastAPI(title="Feili Personal Memory Hub", version="0.2.0")
     static_root = Path(__file__).resolve().parent / "static"
     app.mount("/assets", StaticFiles(directory=static_root), name="memory-assets")
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"ok": True, "server": "feili-personal-memory", "version": "0.1.0"}
+        return {"ok": True, "server": "feili-personal-memory", "version": "0.2.0"}
 
     @app.get("/.well-known/agent-memory.json")
     async def agent_manifest() -> dict[str, Any]:
         return {
             "name": "Feili Personal Memory Hub",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/health",
             "scopes": list(MEMORY_SCOPES),
@@ -191,6 +223,73 @@ def create_app(hub: MemoryHub) -> FastAPI:
             int(payload.get("char_budget", 6000)),
         )
 
+    @app.get("/api/candidates")
+    async def api_candidates(status: str = "pending") -> JSONResponse:
+        try:
+            candidates = await run_in_threadpool(hub.review_memories, status=status)
+            return JSONResponse(content={"status": status, "candidates": candidates})
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.post("/api/candidates/propose")
+    async def api_propose_candidate(request: Request) -> JSONResponse:
+        payload = await request.json()
+        try:
+            candidate = await run_in_threadpool(
+                hub.propose_memory,
+                scope=str(payload.get("scope", "")),
+                content=str(payload.get("content", "")),
+                reason=str(payload.get("reason", "")),
+                source=str(payload.get("source", "dashboard")),
+                session_id=(
+                    str(payload["session_id"])
+                    if payload.get("session_id") is not None
+                    else None
+                ),
+            )
+            return JSONResponse(content={"candidate": candidate})
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.patch("/api/candidates/{candidate_id}")
+    async def api_update_candidate(candidate_id: str, request: Request) -> JSONResponse:
+        payload = await request.json()
+        try:
+            candidate = await run_in_threadpool(
+                hub.review_memory,
+                candidate_id,
+                "update",
+                scope=payload.get("scope"),
+                content=payload.get("content"),
+                note=str(payload.get("note", "")),
+            )
+            return JSONResponse(content={"candidate": candidate})
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.post("/api/candidates/{candidate_id}/decision")
+    async def api_decide_candidate(candidate_id: str, request: Request) -> JSONResponse:
+        payload = await request.json()
+        action = str(payload.get("action", "")).strip()
+        if action not in {"approve", "reject", "forget"}:
+            return JSONResponse(status_code=422, content={"detail": "invalid decision action"})
+        try:
+            candidate = await run_in_threadpool(
+                hub.review_memory,
+                candidate_id,
+                action,
+                scope=payload.get("scope"),
+                content=payload.get("content"),
+                note=str(payload.get("note", "")),
+            )
+            return JSONResponse(content={"candidate": candidate})
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (ValueError, RuntimeError) as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
+
     @app.post("/mcp")
     async def mcp(request: Request) -> JSONResponse:
         message = await request.json()
@@ -204,7 +303,7 @@ def create_app(hub: MemoryHub) -> FastAPI:
             result = {
                 "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}, "resources": {}},
-                "serverInfo": {"name": "feili-personal-memory", "version": "0.1.0"},
+                "serverInfo": {"name": "feili-personal-memory", "version": "0.2.0"},
             }
         elif method == "ping":
             result = {}

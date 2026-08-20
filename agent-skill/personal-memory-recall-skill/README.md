@@ -63,6 +63,7 @@ Direct client checks:
 python scripts/memory_client.py check-prereqs
 python scripts/memory_client.py context "我喜欢什么样的界面" --scopes profile
 python scripts/memory_client.py sync --scopes episodes vault
+python scripts/memory_client.py propose "阿飞偏好可审计的自动化" --scope profile
 ```
 
 Agents should also activate the skill automatically when a request depends on previous
@@ -77,7 +78,15 @@ codex mcp add personal_memory --url http://127.0.0.1:8771/mcp
 ```
 
 Restart the client after changing MCP configuration. The server exposes
-`memory_status`, `memory_sync`, `memory_search`, and `memory_context`.
+`memory_status`, `memory_sync`, `memory_search`, `memory_context`, and the review-only
+`memory_propose`. Approval and forgetting are available only in the local dashboard.
+
+## Codex native hooks
+
+`scripts/codex_memory_hook.py` handles `UserPromptSubmit` and `Stop`. It retrieves
+relevant memory before complex prompts and submits completed-task candidates after a
+turn. The bridge uses only loopback HTTP and Python's standard library. Codex requires
+the exact command hook to be reviewed once after installation.
 
 ## Verification
 
@@ -94,6 +103,7 @@ Expected readiness response includes `"ready": true` and service identity
 - Connection refused: start the local Memory Hub and rerun `check-prereqs`.
 - Wrong service identity: another process owns port 8771; do not bypass the check.
 - Empty result: choose the correct scope, inspect `status`, then refresh that scope.
+- Candidate not written: expected until it is approved in the Memory Observatory.
 - Vector provider disabled: expected by default; lexical retrieval remains local.
 - Obsidian URI does not open: verify the local vault name and URI handler.
 

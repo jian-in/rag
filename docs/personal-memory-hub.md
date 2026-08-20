@@ -6,7 +6,7 @@ Build a local-first memory layer for Afei's agents. It keeps three memory domain
 
 ## Memory domains
 
-1. `vault` — selected Markdown notes from the Obsidian vault. The vault remains the source of truth and is read-only to the indexer.
+1. `vault` — selected Markdown notes from the Obsidian vault. The indexer is read-only; approved Agent candidates may enter only the managed `00-Inbox/Agent Memory Inbox.md` note.
 2. `profile` — curated user and assistant identity pages (`USER_PROFILE.md` and `FEILI_SOUL.md`).
 3. `episodes` — current project context, memory log, and curated rollout summaries. Raw chat transcripts, secrets, backups, and dynamic dream material are excluded by default.
 
@@ -14,12 +14,14 @@ Each domain has its own SQLite index file. A federated search queries the reques
 
 ## Public interface
 
-The `MemoryHub` module exposes four operations:
+The `MemoryHub` module exposes retrieval plus a human-reviewed write path:
 
 - `sync(scopes=None)` — incrementally synchronize selected domains.
 - `search(query, scopes=None, top_k=8)` — return ranked, cited memory hits.
 - `context(query, scopes=None, top_k=8, char_budget=6000)` — return an agent-ready context bundle.
 - `status()` — report source paths, index counts, model configuration, and last sync state without exposing credentials.
+- `propose_memory(...)` — create a deduplicated pending candidate without changing sources.
+- `review_memory(...)` — let the local human interface update, approve, reject, or precisely forget a managed candidate.
 
 Callers do not manage files, chunks, databases, embeddings, or reranking directly.
 
@@ -39,6 +41,8 @@ Callers do not manage files, chunks, databases, embeddings, or reranking directl
 - Use explicit source allowlists; do not scan arbitrary home folders.
 - Ignore `.env`, credentials, backups, raw Codex sessions, Obsidian internals, attachments, and archives by default.
 - Indexes are derived local state and may be rebuilt from source files.
+- Review state lives in a separate control-plane SQLite database and is never searched as a fourth memory domain.
+- Agent-facing tools can propose but cannot approve, reject, edit, or forget.
 
 ## Agent entry
 
@@ -48,6 +52,7 @@ Expose the same hub through a local streamable HTTP MCP endpoint with these tool
 - `memory_sync`
 - `memory_search`
 - `memory_context`
+- `memory_propose`
 
 Also expose a local dashboard for humans and a well-known JSON manifest so other agent hosts can discover the endpoint and scope rules.
 
@@ -60,6 +65,8 @@ Also expose a local dashboard for humans and a well-known JSON manifest so other
 5. Obsidian hits contain a working vault-relative locator and source file remains unchanged.
 6. MCP tools and dashboard use the same `MemoryHub` interface.
 7. The server starts on loopback, reports healthy state, and provides no secret values.
+8. Candidate approval writes one identifiable managed block; forgetting removes only that block.
+9. Codex hooks skip trivial and secret-like prompts and never directly mutate memory sources.
 
 ## Local operation
 
@@ -105,6 +112,11 @@ codex mcp add personal_memory --url http://127.0.0.1:8771/mcp
 Restart the Agent host after changing MCP configuration. Agents should call
 `memory_context` before asking Afei to repeat known preferences or active project
 decisions.
+
+Codex native hooks can call the installed skill's `codex_memory_hook.py` at
+`UserPromptSubmit` and `Stop`. The first injects compact retrieved context; the second
+may submit a completed-task candidate. Codex requires a one-time review of the exact
+command hook after installation.
 
 ## Optional SiliconFlow providers
 

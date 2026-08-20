@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 
 
 SKILL_NAME = "personal-memory-recall-skill"
-SKILL_VERSION = "1.0.0"
+SKILL_VERSION = "1.1.0"
 SCOPES = ("vault", "profile", "episodes")
 DEFAULT_ENDPOINT = "http://127.0.0.1:8771"
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "assets" / "config.json"
@@ -254,6 +254,42 @@ class MemoryClient:
         selected = _validate_scopes(scopes)
         return self._request("/api/sync", {"scopes": selected} if selected is not None else {})
 
+    def propose(
+        self,
+        scope: str,
+        content: str,
+        reason: str = "",
+        source: str = "agent",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit a pending candidate without writing to any memory source."""
+        selected = _validate_scopes([scope])
+        assert selected is not None
+        normalized = content.strip()
+        if not 3 <= len(normalized) <= 4000:
+            raise ClientError(
+                "Memory content must be 3-4000 characters.",
+                "validation",
+                "Submit one concise, reviewable memory candidate.",
+            )
+        payload: dict[str, Any] = {
+            "scope": selected[0],
+            "content": normalized,
+            "reason": reason.strip(),
+            "source": source.strip() or "agent",
+        }
+        if session_id:
+            payload["session_id"] = session_id.strip()
+        result = self._request("/api/candidates/propose", payload)
+        candidate = result.get("candidate")
+        if not isinstance(candidate, dict) or candidate.get("status") != "pending":
+            raise ClientError(
+                "Memory Hub did not return a pending candidate.",
+                "runtime",
+                "Update or restart the local Memory Hub.",
+            )
+        return candidate
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retrieve Afei's local personal memories.")
@@ -277,6 +313,12 @@ def _parser() -> argparse.ArgumentParser:
 
     sync = commands.add_parser("sync", help="Refresh isolated local indexes.")
     sync.add_argument("--scopes", nargs="+", choices=SCOPES)
+    propose = commands.add_parser("propose", help="Submit a candidate for local human review.")
+    propose.add_argument("content")
+    propose.add_argument("--scope", required=True, choices=SCOPES)
+    propose.add_argument("--reason", default="")
+    propose.add_argument("--source", default="agent")
+    propose.add_argument("--session-id")
     return parser
 
 
@@ -329,7 +371,15 @@ def _diagnostics(client: MemoryClient) -> dict[str, Any]:
         "version": SKILL_VERSION,
         "harness_level": "loopback-client",
         "endpoint": client.endpoint,
-        "commands": ["status", "search", "context", "sync", "check-prereqs", "diagnostics"],
+        "commands": [
+            "status",
+            "search",
+            "context",
+            "sync",
+            "propose",
+            "check-prereqs",
+            "diagnostics",
+        ],
         "scopes": list(SCOPES),
         "harness_features": {
             "input_validation": True,
@@ -356,6 +406,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = client.context(args.query, args.scopes, args.top_k, args.char_budget)
         elif args.command == "sync":
             result = client.sync(args.scopes)
+        elif args.command == "propose":
+            result = client.propose(
+                args.scope, args.content, args.reason, args.source, args.session_id
+            )
         elif args.command == "check-prereqs":
             result = _prerequisites(client)
         else:

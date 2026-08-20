@@ -43,6 +43,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send({"query": payload["query"], "result_count": 0, "results": []})
         elif self.path == "/api/sync":
             self._send({"scopes": payload.get("scopes")})
+        elif self.path == "/api/candidates/propose":
+            self._send({"candidate": {"id": "candidate-1", "status": "pending", **payload}})
         else:
             self.send_error(404)
 
@@ -87,6 +89,17 @@ class MemoryClientTests(unittest.TestCase):
     def test_health_verifies_service_identity(self) -> None:
         result = MODULE.MemoryClient(self.endpoint).health()
         self.assertEqual(result["server"], "feili-personal-memory")
+
+    def test_propose_only_creates_a_pending_review_candidate(self) -> None:
+        result = MODULE.MemoryClient(self.endpoint).propose(
+            "profile",
+            "阿飞偏好可审计的自动化。",
+            "稳定工作偏好。",
+            "test-agent",
+            "session-1",
+        )
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["scope"], "profile")
 
 
 if __name__ == "__main__":

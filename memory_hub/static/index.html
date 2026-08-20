@@ -110,6 +110,27 @@
         </footer>
       </aside>
     </section>
+
+    <section class="review-panel" aria-labelledby="review-title">
+      <div class="section-heading review-heading">
+        <div>
+          <p class="eyebrow">HUMAN REVIEW GATE</p>
+          <h2 id="review-title">候选记忆审核</h2>
+          <p class="review-intro">Agent 只能提交候选。只有你在这里确认后，它才会进入对应记忆舱。</p>
+        </div>
+        <span id="pending-count" class="count-chip">0 条待审核</span>
+      </div>
+      <div class="review-toolbar" aria-label="候选记忆状态">
+        <button class="review-filter active" type="button" data-review-status="pending">待审核</button>
+        <button class="review-filter" type="button" data-review-status="approved">已批准</button>
+        <button class="review-filter" type="button" data-review-status="rejected">已拒绝</button>
+        <button class="review-filter" type="button" data-review-status="forgotten">已忘记</button>
+        <button id="review-refresh" class="quiet-button review-refresh" type="button">刷新候选</button>
+      </div>
+      <div id="review-list" class="review-list" aria-live="polite">
+        <div class="review-empty">正在读取本机审核队列……</div>
+      </div>
+    </section>
   </main>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>

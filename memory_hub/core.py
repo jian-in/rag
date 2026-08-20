@@ -134,6 +134,145 @@ class MemoryHub:
         self.embedding_provider = embedding_provider
         self.rerank_provider = rerank_provider
         self._last_provider_error: str | None = None
+        from .review import MemoryReviewQueue
+
+        self._review_queue = MemoryReviewQueue(self.settings.index_root.parent / "audit.sqlite3")
+
+    def propose_memory(
+        self,
+        *,
+        scope: str,
+        content: str,
+        reason: str = "",
+        source: str = "agent",
+        session_id: str | None = None,
+    ) -> dict[str, object]:
+        return self._review_queue.propose(
+            scope=scope,
+            content=content,
+            reason=reason,
+            source=source,
+            session_id=session_id,
+        )
+
+    def review_memories(self, *, status: str = "pending") -> list[dict[str, object]]:
+        return self._review_queue.list(status=status)
+
+    def review_memory(
+        self,
+        candidate_id: str,
+        action: str,
+        *,
+        scope: str | None = None,
+        content: str | None = None,
+        note: str = "",
+    ) -> dict[str, object]:
+        if action == "update":
+            return self._review_queue.update_pending(
+                candidate_id, scope=scope, content=content, note=note
+            )
+        if action == "reject":
+            if scope is not None or content is not None:
+                raise ValueError("reject does not accept scope or content changes")
+            return self._review_queue.transition(
+                candidate_id,
+                expected_status="pending",
+                status="rejected",
+                note=note,
+            )
+        if action == "approve":
+            candidate = self._review_queue.update_pending(
+                candidate_id, scope=scope, content=content, note=note
+            )
+            target = self._review_target(str(candidate["scope"]))
+            added = self._append_managed_memory(
+                target,
+                candidate_id=candidate_id,
+                content=str(candidate["content"]),
+            )
+            try:
+                self.sync((str(candidate["scope"]),))
+            except Exception:
+                if added:
+                    self._remove_managed_memory(target, candidate_id=candidate_id)
+                    try:
+                        self.sync((str(candidate["scope"]),))
+                    except Exception:
+                        pass
+                raise
+            try:
+                return self._review_queue.transition(
+                    candidate_id,
+                    expected_status="pending",
+                    status="approved",
+                    target_path=str(target),
+                    note=note,
+                )
+            except Exception:
+                current = self._review_queue.get(candidate_id)
+                if current["status"] == "approved":
+                    return current
+                if added:
+                    self._remove_managed_memory(target, candidate_id=candidate_id)
+                    try:
+                        self.sync((str(candidate["scope"]),))
+                    except Exception:
+                        pass
+                raise
+        if action == "forget":
+            if scope is not None or content is not None:
+                raise ValueError("forget does not accept scope or content changes")
+            candidate = self._review_queue.get(candidate_id)
+            if candidate["status"] != "approved":
+                raise ValueError("only approved memory candidates can be forgotten")
+            target_text = candidate.get("target_path")
+            if not target_text:
+                raise RuntimeError("approved memory candidate has no managed target")
+            target = Path(str(target_text)).resolve()
+            expected_target = self._review_target(str(candidate["scope"]))
+            if target != expected_target:
+                raise RuntimeError("managed memory target does not match its configured scope")
+            removed = self._remove_managed_memory(target, candidate_id=candidate_id)
+            try:
+                self.sync((str(candidate["scope"]),))
+            except Exception:
+                if removed:
+                    self._append_managed_memory(
+                        target,
+                        candidate_id=candidate_id,
+                        content=str(candidate["content"]),
+                    )
+                    try:
+                        self.sync((str(candidate["scope"]),))
+                    except Exception:
+                        pass
+                raise
+            try:
+                return self._review_queue.transition(
+                    candidate_id,
+                    expected_status="approved",
+                    status="forgotten",
+                    note=note,
+                )
+            except Exception:
+                current = self._review_queue.get(candidate_id)
+                if current["status"] == "forgotten":
+                    return current
+                if removed:
+                    self._append_managed_memory(
+                        target,
+                        candidate_id=candidate_id,
+                        content=str(candidate["content"]),
+                    )
+                    try:
+                        self.sync((str(candidate["scope"]),))
+                    except Exception:
+                        pass
+                raise
+        raise ValueError(f"unknown review action: {action}")
+
+    def memory_review_history(self, candidate_id: str) -> list[dict[str, object]]:
+        return self._review_queue.history(candidate_id)
 
     def sync(self, scopes: Sequence[str] | None = None) -> dict[str, object]:
         selected = self._normalize_scopes(scopes)
@@ -267,6 +406,7 @@ class MemoryHub:
                 "model": getattr(self.rerank_provider, "model_name", None),
             },
             "provider_error": self._last_provider_error,
+            "review": self._review_queue.counts(),
         }
 
     def _sync_scope(self, scope: str) -> dict[str, int]:
@@ -329,12 +469,27 @@ class MemoryHub:
         if scope == "vault":
             if not self.settings.vault_root.is_dir():
                 return
+            managed_inbox = self._review_target("vault")
+            yielded_paths: set[Path] = set()
+            if managed_inbox.is_file():
+                yielded_paths.add(managed_inbox.resolve())
+                note_key = managed_inbox.relative_to(self.settings.vault_root).with_suffix("").as_posix()
+                vault_name = quote(self.settings.vault_root.name, safe="")
+                yield _SourceDocument(
+                    scope,
+                    managed_inbox,
+                    managed_inbox.relative_to(self.settings.vault_root).as_posix(),
+                    managed_inbox.stem,
+                    f"obsidian://open?vault={vault_name}&file=" + quote(note_key, safe="/"),
+                )
             for include_dir in self.settings.vault_include_dirs:
                 base = self.settings.vault_root / include_dir
                 if not base.is_dir():
                     continue
                 for path in sorted(base.rglob("*.md")):
                     if any(part.startswith(".") for part in path.relative_to(base).parts):
+                        continue
+                    if path.resolve() in yielded_paths:
                         continue
                     relative = path.relative_to(self.settings.vault_root).as_posix()
                     note_key = path.relative_to(self.settings.vault_root).with_suffix("").as_posix()
@@ -360,6 +515,67 @@ class MemoryHub:
             for path in sorted(self.settings.rollout_root.glob("*.md")):
                 source_key = f"rollout_summaries/{path.name}"
                 yield _SourceDocument(scope, path, source_key, path.stem, None)
+
+    def _review_target(self, scope: str) -> Path:
+        if scope == "profile":
+            target = self.settings.memory_root / "USER_PROFILE.md"
+            root = self.settings.memory_root
+        elif scope == "episodes":
+            target = self.settings.memory_root / "CURRENT_CONTEXT.md"
+            root = self.settings.memory_root
+        elif scope == "vault":
+            target = self.settings.vault_root / "00-Inbox" / "Agent Memory Inbox.md"
+            root = self.settings.vault_root
+        else:
+            raise ValueError(f"unknown memory scope: {scope}")
+        resolved = target.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError("managed memory target escapes its configured root")
+        return resolved
+
+    @staticmethod
+    def _append_managed_memory(target: Path, *, candidate_id: str, content: str) -> bool:
+        start = f"<!-- feili-memory:{candidate_id}:start -->"
+        end = f"<!-- feili-memory:{candidate_id}:end -->"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing = target.read_text(encoding="utf-8") if target.is_file() else ""
+        if start in existing and end in existing:
+            managed = existing.split(start, 1)[1].split(end, 1)[0]
+            if content.strip() in managed:
+                return False
+            raise RuntimeError("managed memory block already exists with different content")
+        if start in existing or end in existing:
+            raise RuntimeError("managed memory block markers are incomplete")
+        if not existing:
+            existing = "# Agent Memory Inbox\n" if target.name == "Agent Memory Inbox.md" else ""
+        block = f"{start}\n\n## 审核记忆 {candidate_id[:8]}\n\n{content.strip()}\n\n{end}"
+        target.write_text(existing.rstrip() + "\n\n" + block + "\n", encoding="utf-8")
+        return True
+
+    @staticmethod
+    def _remove_managed_memory(target: Path, *, candidate_id: str) -> bool:
+        if not target.is_file():
+            return False
+        start = re.escape(f"<!-- feili-memory:{candidate_id}:start -->")
+        end = re.escape(f"<!-- feili-memory:{candidate_id}:end -->")
+        text = target.read_text(encoding="utf-8")
+        start_text = f"<!-- feili-memory:{candidate_id}:start -->"
+        end_text = f"<!-- feili-memory:{candidate_id}:end -->"
+        if start_text not in text and end_text not in text:
+            return False
+        if start_text not in text or end_text not in text:
+            raise RuntimeError("managed memory block markers are incomplete")
+        updated, count = re.subn(
+            rf"\n*{start}.*?{end}\n*",
+            "\n\n",
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        if count != 1:
+            raise RuntimeError("managed memory block could not be found")
+        target.write_text(updated.rstrip() + "\n", encoding="utf-8")
+        return True
 
     def _index_source(
         self,

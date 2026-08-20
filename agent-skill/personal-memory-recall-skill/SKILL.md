@@ -7,11 +7,12 @@ description: >-
   know about me, current project, previous decision, 记得、以前、继续、我的偏好、项目进展、
   上次决定. Searches three isolated scopes: profile, episodes, and vault. Prefer the
   local memory_context MCP tool; fall back to the bundled loopback-only HTTP client.
+  Codex native hooks may prefetch context and submit review-only memory candidates.
 license: MIT
 activation: /personal-memory-recall-skill
 metadata:
   author: Feili for Afei
-  version: 1.0.0
+  version: 1.1.0
   created: 2026-08-20
   last_reviewed: 2026-08-20
   review_interval_days: 90
@@ -24,7 +25,7 @@ metadata:
     context: "object with query, context, hits, and char_budget"
 provenance:
   maintainer: Feili
-  version: 1.0.0
+  version: 1.1.0
   created: 2026-08-20
   source_references:
     - Feili Personal Memory Hub local API
@@ -126,6 +127,18 @@ loopback.
 python scripts/memory_client.py sync --scopes profile episodes vault
 ```
 
+## Audited memory proposals
+
+Use `memory_propose` only when the user explicitly asks to remember something or a
+completed task produced a durable outcome. A proposal always remains `pending`: Agents
+cannot approve, reject, edit, or forget memories. Those actions belong to the local
+Memory Observatory at `http://127.0.0.1:8771/`.
+
+The Codex hook bridge in `scripts/codex_memory_hook.py` can automatically retrieve
+context before a complex prompt. At `Stop`, it may submit a compact task-outcome
+candidate when the answer contains a clear completion signal. It never writes directly
+to the three memory sources, skips trivial prompts, and rejects secret-like text.
+
 ## Privacy and Safety
 
 - Never send retrieved memory to an external service unless Afei explicitly authorizes
@@ -134,6 +147,7 @@ python scripts/memory_client.py sync --scopes profile episodes vault
   the Memory Hub, not this skill.
 - Do not bypass scope isolation by reading the SQLite files directly.
 - Do not index raw secrets, backups, dreams, or entire chat archives through this skill.
+- Never use an Agent tool to bypass the dashboard review gate.
 - Preserve source locators in internal reasoning so claims can be checked.
 - If the service is unavailable, report the local connectivity problem. Do not pretend
   that no memory exists.
@@ -146,6 +160,7 @@ python scripts/memory_client.py sync --scopes profile episodes vault
 | `search QUERY` | Return ranked hits with locators |
 | `context QUERY` | Return a compact context bundle for an Agent |
 | `sync` | Incrementally refresh selected isolated indexes |
+| `propose CONTENT --scope SCOPE` | Submit a pending, human-reviewed candidate |
 | `check-prereqs` | Verify Python, config, endpoint, and service health |
 | `diagnostics` | Print skill capabilities without revealing secrets |
 

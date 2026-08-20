@@ -29,3 +29,10 @@ memory.
 `urllib`, `json`, and `argparse` are sufficient. Avoiding third-party packages makes the
 fallback usable in more Agent environments and removes package-install and supply-chain
 friction.
+
+## Native hooks with a human write gate
+
+Codex `UserPromptSubmit` and `Stop` hooks provide automatic recall and task-outcome
+capture without adding another Agent runtime. Hooks and MCP may create only pending
+candidates. Dashboard decisions are kept outside the Agent tool surface, and approved
+content is written as an individually removable managed block.
