@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071312">
+  <title>绯梨记忆观测台</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <main class="shell">
+    <header class="masthead">
+      <div class="sigil" aria-hidden="true">
+        <span>緋</span>
+      </div>
+      <div class="title-block">
+        <p class="eyebrow">FEILI · PERSONAL MEMORY OBSERVATORY</p>
+        <h1>绯梨记忆观测台</h1>
+        <p class="subtitle">三座记忆舱彼此独立，只在你需要时汇成一束光。</p>
+      </div>
+      <div class="live-state" id="live-state" aria-live="polite">
+        <span class="pulse"></span>
+        <span id="live-label">正在确认本机入口</span>
+      </div>
+    </header>
+
+    <section class="memory-deck" aria-label="记忆索引状态">
+      <article class="memory-card vault-card" data-scope="vault">
+        <div class="card-orbit" aria-hidden="true"></div>
+        <p class="card-index">01 / VAULT</p>
+        <h2>知识穹顶</h2>
+        <p>Obsidian 项目、领域与资源笔记</p>
+        <div class="card-metric"><strong id="count-vault">—</strong><span>片记忆</span></div>
+        <small id="sync-vault">尚未读取状态</small>
+      </article>
+      <article class="memory-card profile-card" data-scope="profile">
+        <div class="card-orbit" aria-hidden="true"></div>
+        <p class="card-index">02 / PROFILE</p>
+        <h2>身份底片</h2>
+        <p>你的偏好、习惯与绯梨身份页</p>
+        <div class="card-metric"><strong id="count-profile">—</strong><span>片记忆</span></div>
+        <small id="sync-profile">尚未读取状态</small>
+      </article>
+      <article class="memory-card episode-card" data-scope="episodes">
+        <div class="card-orbit" aria-hidden="true"></div>
+        <p class="card-index">03 / EPISODES</p>
+        <h2>经历潮汐</h2>
+        <p>当前上下文、变更记录与会话提炼</p>
+        <div class="card-metric"><strong id="count-episodes">—</strong><span>片记忆</span></div>
+        <small id="sync-episodes">尚未读取状态</small>
+      </article>
+    </section>
+
+    <section class="console-panel">
+      <form id="search-form" class="search-form">
+        <label for="query">你想让我想起什么？</label>
+        <div class="query-row">
+          <span class="prompt-mark" aria-hidden="true">⌁</span>
+          <input id="query" name="query" type="search" autocomplete="off"
+                 placeholder="例如：我最近在做什么，或我偏好怎样的界面？" required>
+          <button class="primary-button" type="submit">
+            <span>检索记忆</span><span aria-hidden="true">↗</span>
+          </button>
+        </div>
+        <div class="scope-row">
+          <fieldset>
+            <legend>检索范围</legend>
+            <label><input type="checkbox" name="scope" value="vault" checked><span>知识穹顶</span></label>
+            <label><input type="checkbox" name="scope" value="profile" checked><span>身份底片</span></label>
+            <label><input type="checkbox" name="scope" value="episodes" checked><span>经历潮汐</span></label>
+          </fieldset>
+          <div class="actions">
+            <button id="context-button" type="button" class="quiet-button" disabled>生成 Agent 上下文</button>
+            <button id="sync-button" type="button" class="quiet-button">同步三座记忆舱</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section class="workbench">
+      <div class="results-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">RECALL TRACE</p>
+            <h2>召回轨迹</h2>
+          </div>
+          <span id="result-count" class="count-chip">等待检索</span>
+        </div>
+        <div id="results" class="results" aria-live="polite">
+          <div class="empty-state">
+            <span class="empty-glyph" aria-hidden="true">◌</span>
+            <p>输入一个念头，我会沿着三座记忆舱寻找与你此刻最相关的片段。</p>
+          </div>
+        </div>
+      </div>
+
+      <aside class="context-panel" aria-labelledby="context-title">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">AGENT CONTEXT</p>
+            <h2 id="context-title">交给助手的记忆</h2>
+          </div>
+          <button id="copy-button" class="icon-button" type="button" title="复制上下文" disabled>复制</button>
+        </div>
+        <pre id="context-output">检索后可生成一段带来源、限长且可直接注入 Agent 的上下文。</pre>
+        <footer>
+          <span id="provider-label">本地检索模式</span>
+          <span>仅监听 127.0.0.1</span>
+        </footer>
+      </aside>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

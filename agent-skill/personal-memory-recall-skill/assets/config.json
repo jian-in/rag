@@ -1,0 +1,21 @@
+{
+  "_comment": "Loopback-only client settings for Feili Personal Memory Hub.",
+  "endpoint": "http://127.0.0.1:8771",
+  "scopes": [
+    "vault",
+    "profile",
+    "episodes"
+  ],
+  "defaults": {
+    "top_k": 8,
+    "char_budget": 6000,
+    "request_timeout_seconds": 20,
+    "sync_timeout_seconds": 180
+  },
+  "privacy": {
+    "loopback_only": true,
+    "external_network_required": false,
+    "secrets_in_queries_allowed": false,
+    "_note": "External embedding and rerank providers are configured only in the Memory Hub, never in this skill."
+  }
+}
