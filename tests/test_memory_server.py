@@ -53,6 +53,7 @@ class MemoryServerTests(unittest.TestCase):
             )
             self.assertEqual(result["result_count"], 1)
             self.assertEqual(result["results"][0]["scope"], "profile")
+            self.assertEqual(result["retrieval_mode"], "hybrid")
 
     def test_http_app_serves_health_manifest_and_streamable_mcp(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -96,13 +97,29 @@ class MemoryServerTests(unittest.TestCase):
                     },
                 },
             )
+            local_context = client.post(
+                "/api/context",
+                json={
+                    "query": "精巧",
+                    "scopes": ["profile"],
+                    "retrieval_mode": "local",
+                },
+            )
+            invalid_context = client.post(
+                "/api/context",
+                json={"query": "精巧", "retrieval_mode": "remote"},
+            )
 
             self.assertTrue(health.json()["ok"])
             self.assertEqual(manifest.json()["mcp_endpoint"], "/mcp")
+            self.assertEqual(manifest.json()["default_retrieval_mode"], "hybrid")
+            self.assertEqual(manifest.json()["automatic_hook_mode"], "local")
             self.assertEqual(len(tools.json()["result"]["tools"]), 5)
             self.assertEqual(
                 search.json()["result"]["structuredContent"]["result_count"], 1
             )
+            self.assertEqual(local_context.json()["retrieval_mode"], "local")
+            self.assertEqual(invalid_context.status_code, 422)
 
             dashboard = client.get("/")
             stylesheet = client.get("/assets/app.css")

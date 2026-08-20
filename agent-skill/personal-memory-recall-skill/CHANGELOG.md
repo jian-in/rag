@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 - 2026-08-20
+
+- Added explicit `local` and `hybrid` retrieval modes across Memory Hub interfaces.
+- Switched native prompt hooks to local-only recall so they never call remote models.
+- Kept MCP, dashboard, and client deep retrieval hybrid by default.
+
 ## 1.1.0 - 2026-08-20
 
 - Added Codex native prompt and stop hooks for automatic local recall.

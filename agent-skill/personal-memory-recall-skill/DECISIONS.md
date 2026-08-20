@@ -36,3 +36,11 @@ Codex `UserPromptSubmit` and `Stop` hooks provide automatic recall and task-outc
 capture without adding another Agent runtime. Hooks and MCP may create only pending
 candidates. Dashboard decisions are kept outside the Agent tool surface, and approved
 content is written as an individually removable managed block.
+
+## Local prompt path, hybrid deep path
+
+Automatic `UserPromptSubmit` recall uses explicit local lexical retrieval to keep the
+blocking prompt hook fast and independent of external providers. MCP, dashboard, and
+client queries remain hybrid by default so deliberate research retains semantic vectors
+and reranking. One retrieval-mode parameter keeps this variation behind the Memory Hub
+interface instead of duplicating retrieval implementations.

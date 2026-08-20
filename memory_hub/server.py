@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from .core import MEMORY_SCOPES, MemoryHub
+from .core import MEMORY_SCOPES, RETRIEVAL_MODES, MemoryHub
 
 
 class MemoryMCPError(RuntimeError):
@@ -28,6 +28,12 @@ class MemoryMCP:
             "items": {"type": "string", "enum": list(MEMORY_SCOPES)},
             "uniqueItems": True,
             "description": "Optional isolated memory domains to query.",
+        }
+        retrieval_mode_schema = {
+            "type": "string",
+            "enum": list(RETRIEVAL_MODES),
+            "default": "hybrid",
+            "description": "Use local for lexical-only low-latency recall; hybrid may call configured embedding and reranking providers.",
         }
         return [
             {
@@ -62,6 +68,7 @@ class MemoryMCP:
                             "maximum": 50,
                             "default": 8,
                         },
+                        "retrieval_mode": retrieval_mode_schema,
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -87,6 +94,7 @@ class MemoryMCP:
                             "maximum": 30000,
                             "default": 6000,
                         },
+                        "retrieval_mode": retrieval_mode_schema,
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -121,13 +129,16 @@ class MemoryMCP:
             query = str(arguments.get("query", "")).strip()
             if not query:
                 raise MemoryMCPError("query is required")
+            retrieval_mode = str(arguments.get("retrieval_mode", "hybrid"))
             hits = self.hub.search(
                 query,
                 scopes=scopes,
                 top_k=int(arguments.get("top_k", 8)),
+                retrieval_mode=retrieval_mode,
             )
             return {
                 "query": query,
+                "retrieval_mode": retrieval_mode,
                 "result_count": len(hits),
                 "results": [hit.as_dict() for hit in hits],
             }
@@ -140,6 +151,7 @@ class MemoryMCP:
                 scopes=scopes,
                 top_k=int(arguments.get("top_k", 8)),
                 char_budget=int(arguments.get("char_budget", 6000)),
+                retrieval_mode=str(arguments.get("retrieval_mode", "hybrid")),
             )
         if name == "memory_propose":
             scope = str(arguments.get("scope", "")).strip()
@@ -162,22 +174,25 @@ class MemoryMCP:
 
 def create_app(hub: MemoryHub) -> FastAPI:
     tools = MemoryMCP(hub)
-    app = FastAPI(title="Feili Personal Memory Hub", version="0.2.0")
+    app = FastAPI(title="Feili Personal Memory Hub", version="0.3.0")
     static_root = Path(__file__).resolve().parent / "static"
     app.mount("/assets", StaticFiles(directory=static_root), name="memory-assets")
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"ok": True, "server": "feili-personal-memory", "version": "0.2.0"}
+        return {"ok": True, "server": "feili-personal-memory", "version": "0.3.0"}
 
     @app.get("/.well-known/agent-memory.json")
     async def agent_manifest() -> dict[str, Any]:
         return {
             "name": "Feili Personal Memory Hub",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/health",
             "scopes": list(MEMORY_SCOPES),
+            "retrieval_modes": list(RETRIEVAL_MODES),
+            "default_retrieval_mode": "hybrid",
+            "automatic_hook_mode": "local",
             "recommended_tool": "memory_context",
             "instruction": "Retrieve relevant memory before asking Afei to repeat known preferences or active project context.",
         }
@@ -197,14 +212,22 @@ def create_app(hub: MemoryHub) -> FastAPI:
         query = str(payload.get("query", "")).strip()
         if not query:
             return JSONResponse(status_code=422, content={"detail": "query is required"})
+        retrieval_mode = str(payload.get("retrieval_mode", "hybrid"))
+        if retrieval_mode not in RETRIEVAL_MODES:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": f"retrieval_mode must be one of: {', '.join(RETRIEVAL_MODES)}"},
+            )
         hits = await run_in_threadpool(
             hub.search,
             query,
             payload.get("scopes"),
             int(payload.get("top_k", 8)),
+            retrieval_mode,
         )
         return {
             "query": query,
+            "retrieval_mode": retrieval_mode,
             "result_count": len(hits),
             "results": [hit.as_dict() for hit in hits],
         }
@@ -215,12 +238,19 @@ def create_app(hub: MemoryHub) -> FastAPI:
         query = str(payload.get("query", "")).strip()
         if not query:
             return JSONResponse(status_code=422, content={"detail": "query is required"})
+        retrieval_mode = str(payload.get("retrieval_mode", "hybrid"))
+        if retrieval_mode not in RETRIEVAL_MODES:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": f"retrieval_mode must be one of: {', '.join(RETRIEVAL_MODES)}"},
+            )
         return await run_in_threadpool(
             hub.context,
             query,
             payload.get("scopes"),
             int(payload.get("top_k", 8)),
             int(payload.get("char_budget", 6000)),
+            retrieval_mode,
         )
 
     @app.get("/api/candidates")
@@ -303,7 +333,7 @@ def create_app(hub: MemoryHub) -> FastAPI:
             result = {
                 "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}, "resources": {}},
-                "serverInfo": {"name": "feili-personal-memory", "version": "0.2.0"},
+                "serverInfo": {"name": "feili-personal-memory", "version": "0.3.0"},
             }
         elif method == "ping":
             result = {}

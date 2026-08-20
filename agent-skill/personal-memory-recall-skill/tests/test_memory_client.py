@@ -37,10 +37,18 @@ class _Handler(BaseHTTPRequestHandler):
                     "context": "[profile] USER_PROFILE.md#视觉偏好\n偏爱深色界面。",
                     "hits": [{"scope": "profile", "locator": "USER_PROFILE.md#视觉偏好"}],
                     "char_budget": payload["char_budget"],
+                    "retrieval_mode": payload.get("retrieval_mode", "hybrid"),
                 }
             )
         elif self.path == "/api/search":
-            self._send({"query": payload["query"], "result_count": 0, "results": []})
+            self._send(
+                {
+                    "query": payload["query"],
+                    "retrieval_mode": payload.get("retrieval_mode", "hybrid"),
+                    "result_count": 0,
+                    "results": [],
+                }
+            )
         elif self.path == "/api/sync":
             self._send({"scopes": payload.get("scopes")})
         elif self.path == "/api/candidates/propose":
@@ -78,6 +86,13 @@ class MemoryClientTests(unittest.TestCase):
         self.assertEqual(result["hits"][0]["scope"], "profile")
         self.assertEqual(result["char_budget"], 1200)
 
+    def test_context_can_request_local_only_retrieval(self) -> None:
+        result = MODULE.MemoryClient(self.endpoint).context(
+            "界面偏好", ["profile"], 3, 1200, retrieval_mode="local"
+        )
+
+        self.assertEqual(result["retrieval_mode"], "local")
+
     def test_non_loopback_endpoint_is_rejected(self) -> None:
         with self.assertRaises(MODULE.ClientError):
             MODULE.MemoryClient("https://example.com")
@@ -85,6 +100,12 @@ class MemoryClientTests(unittest.TestCase):
     def test_empty_search_result_adds_warning(self) -> None:
         result = MODULE.MemoryClient(self.endpoint).search("不存在", ["vault"], 3)
         self.assertTrue(result["_warnings"])
+
+    def test_search_can_request_local_only_retrieval(self) -> None:
+        result = MODULE.MemoryClient(self.endpoint).search(
+            "界面偏好", ["profile"], 3, retrieval_mode="local"
+        )
+        self.assertEqual(result["retrieval_mode"], "local")
 
     def test_health_verifies_service_identity(self) -> None:
         result = MODULE.MemoryClient(self.endpoint).health()

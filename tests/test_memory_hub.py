@@ -46,7 +46,12 @@ class MemoryHubTests(unittest.TestCase):
             )
             hub.sync()
 
-            profile_hits = hub.search("莓果甜品", scopes=("profile",), top_k=5)
+            profile_hits = hub.search(
+                "莓果甜品",
+                scopes=("profile",),
+                top_k=5,
+                retrieval_mode="local",
+            )
 
             self.assertTrue(profile_hits)
             self.assertEqual({hit.scope for hit in profile_hits}, {"profile"})
@@ -322,6 +327,68 @@ class MemoryHubTests(unittest.TestCase):
             self.assertTrue(hits)
             self.assertEqual(hits[0].heading, "SecondBrain RAG MCP")
             self.assertEqual({hit.scope for hit in hits}, {"episodes"})
+
+    def test_local_context_mode_never_calls_remote_embedding_or_reranking(self) -> None:
+        class CountingEmbeddingProvider:
+            model_name = "counting-embedding"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def embed(self, texts: list[str]) -> list[list[float]]:
+                self.calls += 1
+                return [[1.0, 0.0] for _ in texts]
+
+        class CountingRerankProvider:
+            model_name = "counting-reranker"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def rerank(
+                self, query: str, documents: list[str], top_n: int
+            ) -> list[tuple[int, float]]:
+                self.calls += 1
+                return [(index, 1.0 - index * 0.01) for index in range(top_n)]
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = root / "memory"
+            memory.mkdir()
+            (memory / "USER_PROFILE.md").write_text(
+                "# 工作偏好\n\n阿飞偏好快速且可审计的自动化。", encoding="utf-8"
+            )
+            vault = root / "vault"
+            vault.mkdir()
+            rollouts = root / "rollouts"
+            rollouts.mkdir()
+            embedding = CountingEmbeddingProvider()
+            reranker = CountingRerankProvider()
+            hub = MemoryHub(
+                MemoryHubSettings(
+                    index_root=root / "indexes",
+                    vault_root=vault,
+                    memory_root=memory,
+                    rollout_root=rollouts,
+                    vault_include_dirs=(),
+                ),
+                embedding_provider=embedding,
+                rerank_provider=reranker,
+            )
+            hub.sync(scopes=("profile",))
+            embedding.calls = 0
+
+            bundle = hub.context(
+                "快速自动化",
+                scopes=("profile",),
+                top_k=3,
+                char_budget=1200,
+                retrieval_mode="local",
+            )
+
+            self.assertTrue(bundle["hits"])
+            self.assertEqual(embedding.calls, 0)
+            self.assertEqual(reranker.calls, 0)
 
 
 if __name__ == "__main__":

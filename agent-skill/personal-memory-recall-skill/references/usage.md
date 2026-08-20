@@ -36,6 +36,10 @@ several locators before deciding what to include. `memory_status` checks readine
 `memory_sync` refreshes one or more indexes. `memory_propose` can submit a candidate, but
 it deliberately cannot approve or mutate a source file.
 
+Use `retrieval_mode=local` on latency-sensitive automatic hooks. It searches the three
+local lexical indexes and never calls embedding or reranking providers. Use the default
+`hybrid` mode for deliberate deep retrieval; it adds configured vectors and reranking.
+
 The server advertises its entry document at:
 
 ```text
@@ -68,7 +72,7 @@ Continue a project:
 
 ```bash
 python scripts/memory_client.py context "SecondBrain RAG 当前进展与下一步" \
-  --scopes episodes vault --top-k 8 --char-budget 6000
+  --scopes episodes vault --top-k 8 --char-budget 6000 --retrieval-mode hybrid
 ```
 
 Refresh only changed source domains:

@@ -198,7 +198,9 @@ def _handle_user_prompt(
             pass
 
     try:
-        bundle = client.context(_compact(prompt, 600), scopes, 8, 3000)
+        bundle = client.context(
+            _compact(prompt, 600), scopes, 8, 3000, retrieval_mode="local"
+        )
     except (ClientError, OSError, ValueError):
         return {}
     context = str(bundle.get("context", "")).strip()

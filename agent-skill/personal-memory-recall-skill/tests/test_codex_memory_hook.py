@@ -18,13 +18,18 @@ SPEC.loader.exec_module(MODULE)
 
 class FakeClient:
     def __init__(self) -> None:
-        self.context_calls: list[tuple[str, list[str], int, int]] = []
+        self.context_calls: list[tuple[str, list[str], int, int, str]] = []
         self.proposals: list[dict[str, object]] = []
 
     def context(
-        self, query: str, scopes: list[str], top_k: int, char_budget: int
+        self,
+        query: str,
+        scopes: list[str],
+        top_k: int,
+        char_budget: int,
+        retrieval_mode: str = "hybrid",
     ) -> dict[str, object]:
-        self.context_calls.append((query, scopes, top_k, char_budget))
+        self.context_calls.append((query, scopes, top_k, char_budget, retrieval_mode))
         return {
             "context": "[episodes] CURRENT_CONTEXT.md#记忆中枢\n已启用三域记忆平台。",
             "hits": [{"scope": "episodes"}],
@@ -69,6 +74,7 @@ class CodexMemoryHookTests(unittest.TestCase):
             self.assertEqual(output["hookEventName"], "UserPromptSubmit")
             self.assertIn("CURRENT_CONTEXT.md", output["additionalContext"])
             self.assertIn("episodes", client.context_calls[0][1])
+            self.assertEqual(client.context_calls[0][4], "local")
             self.assertTrue(any(Path(temp).iterdir()))
 
     def test_trivial_prompt_is_skipped_without_retrieval_or_spooling(self) -> None:
@@ -171,7 +177,10 @@ class CodexMemoryHookTests(unittest.TestCase):
     def test_main_forces_utf8_for_windows_native_hook_pipes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             client = FakeClient()
-            client.context = lambda *args: {"context": "✅ 本机记忆已召回。", "hits": []}
+            client.context = lambda *args, **kwargs: {
+                "context": "✅ 本机记忆已召回。",
+                "hits": [],
+            }
             incoming = io.BytesIO(
                 json.dumps(
                     {

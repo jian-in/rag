@@ -9,6 +9,8 @@
   "defaults": {
     "top_k": 8,
     "char_budget": 6000,
+    "retrieval_mode": "hybrid",
+    "automatic_hook_retrieval_mode": "local",
     "request_timeout_seconds": 20,
     "sync_timeout_seconds": 180
   },

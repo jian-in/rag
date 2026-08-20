@@ -62,6 +62,7 @@ Direct client checks:
 ```bash
 python scripts/memory_client.py check-prereqs
 python scripts/memory_client.py context "我喜欢什么样的界面" --scopes profile
+python scripts/memory_client.py context "项目深层语义" --scopes episodes vault --retrieval-mode hybrid
 python scripts/memory_client.py sync --scopes episodes vault
 python scripts/memory_client.py propose "阿飞偏好可审计的自动化" --scope profile
 ```
@@ -85,8 +86,10 @@ Restart the client after changing MCP configuration. The server exposes
 
 `scripts/codex_memory_hook.py` handles `UserPromptSubmit` and `Stop`. It retrieves
 relevant memory before complex prompts and submits completed-task candidates after a
-turn. The bridge uses only loopback HTTP and Python's standard library. Codex requires
-the exact command hook to be reviewed once after installation.
+turn. Automatic recall uses local lexical mode for low latency; deliberate MCP/client
+queries keep hybrid vector and reranking quality by default. The bridge uses only
+loopback HTTP and Python's standard library. Codex requires the exact command hook to be
+reviewed once after installation.
 
 ## Verification
 

@@ -28,6 +28,8 @@ Callers do not manage files, chunks, databases, embeddings, or reranking directl
 ## Retrieval behavior
 
 - Local lexical retrieval is always available and must work without an API key.
+- `retrieval_mode=local` uses only lexical indexes and never calls external providers.
+- `retrieval_mode=hybrid` is the default for deliberate queries and may add vectors and reranking.
 - When a SiliconFlow-compatible embedding key is configured, sync fills missing vectors incrementally.
 - Vector and lexical candidates are fused with reciprocal-rank fusion.
 - When a reranker key is configured, the fused candidate set is reranked before returning the final results.
@@ -116,7 +118,8 @@ decisions.
 Codex native hooks can call the installed skill's `codex_memory_hook.py` at
 `UserPromptSubmit` and `Stop`. The first injects compact retrieved context; the second
 may submit a completed-task candidate. Codex requires a one-time review of the exact
-command hook after installation.
+command hook after installation. The prompt hook explicitly uses local mode; MCP and
+dashboard retrieval remain hybrid by default.
 
 ## Optional SiliconFlow providers
 

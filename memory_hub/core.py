@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 
 MEMORY_SCOPES = ("vault", "profile", "episodes")
+RETRIEVAL_MODES = ("hybrid", "local")
 INDEX_PIPELINE_VERSION = "memory-hub-v3-metadata-headings"
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 ASCII_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*")
@@ -293,6 +294,7 @@ class MemoryHub:
         query: str,
         scopes: Sequence[str] | None = None,
         top_k: int = 8,
+        retrieval_mode: str = "hybrid",
     ) -> list[MemoryHit]:
         if not query.strip():
             return []
@@ -300,6 +302,7 @@ class MemoryHub:
             raise ValueError("top_k must be between 1 and 50")
 
         selected = self._normalize_scopes(scopes)
+        mode = self._normalize_retrieval_mode(retrieval_mode)
         per_scope = max(top_k * 3, top_k)
         ranked_lists: list[list[MemoryHit]] = []
         for scope in selected:
@@ -307,7 +310,7 @@ class MemoryHub:
             if lexical:
                 ranked_lists.append(lexical)
 
-        if self.embedding_provider is not None:
+        if mode == "hybrid" and self.embedding_provider is not None:
             try:
                 query_vector = self.embedding_provider.embed([query])[0]
                 for scope in selected:
@@ -327,7 +330,7 @@ class MemoryHub:
         candidates = [replace(hit, score=score) for hit, score in fused.values()]
 
         candidates.sort(key=lambda item: (-item.score, item.scope, item.source_path, item.chunk_id))
-        if self.rerank_provider is not None and candidates:
+        if mode == "hybrid" and self.rerank_provider is not None and candidates:
             try:
                 reranked = self.rerank_provider.rerank(
                     query,
@@ -353,8 +356,10 @@ class MemoryHub:
         scopes: Sequence[str] | None = None,
         top_k: int = 8,
         char_budget: int = 6000,
+        retrieval_mode: str = "hybrid",
     ) -> dict[str, object]:
-        hits = self.search(query, scopes=scopes, top_k=top_k)
+        mode = self._normalize_retrieval_mode(retrieval_mode)
+        hits = self.search(query, scopes=scopes, top_k=top_k, retrieval_mode=mode)
         remaining = max(0, char_budget)
         parts: list[str] = []
         included: list[MemoryHit] = []
@@ -373,6 +378,7 @@ class MemoryHub:
             "context": "\n\n".join(parts),
             "hits": [hit.as_dict() for hit in included],
             "char_budget": char_budget,
+            "retrieval_mode": mode,
         }
 
     def status(self) -> dict[str, object]:
@@ -814,6 +820,15 @@ class MemoryHub:
         if unknown:
             raise ValueError(f"unknown memory scopes: {', '.join(unknown)}")
         return tuple(dict.fromkeys(selected))
+
+    @staticmethod
+    def _normalize_retrieval_mode(retrieval_mode: str) -> str:
+        if retrieval_mode not in RETRIEVAL_MODES:
+            raise ValueError(
+                f"unknown retrieval mode: {retrieval_mode}; "
+                f"choose from {', '.join(RETRIEVAL_MODES)}"
+            )
+        return retrieval_mode
 
 
 def _file_hash(path: Path) -> str:

@@ -21,8 +21,9 @@ from urllib.request import Request, urlopen
 
 
 SKILL_NAME = "personal-memory-recall-skill"
-SKILL_VERSION = "1.1.0"
+SKILL_VERSION = "1.2.0"
 SCOPES = ("vault", "profile", "episodes")
+RETRIEVAL_MODES = ("hybrid", "local")
 DEFAULT_ENDPOINT = "http://127.0.0.1:8771"
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "assets" / "config.json"
 
@@ -141,6 +142,16 @@ def _validate_scopes(scopes: Sequence[str] | None) -> list[str] | None:
     return selected
 
 
+def _validate_retrieval_mode(retrieval_mode: str) -> str:
+    if retrieval_mode not in RETRIEVAL_MODES:
+        raise ClientError(
+            f"Unknown retrieval mode: {retrieval_mode}.",
+            "validation",
+            f"Choose from: {', '.join(RETRIEVAL_MODES)}.",
+        )
+    return retrieval_mode
+
+
 class MemoryClient:
     """Client for the local Memory Hub HTTP API.
 
@@ -209,11 +220,22 @@ class MemoryClient:
         """Inspect isolated index counts and optional provider readiness."""
         return self._request("/api/status")
 
-    def search(self, query: str, scopes: Sequence[str] | None, top_k: int) -> dict[str, Any]:
+    def search(
+        self,
+        query: str,
+        scopes: Sequence[str] | None,
+        top_k: int,
+        retrieval_mode: str = "hybrid",
+    ) -> dict[str, Any]:
         """Return ranked memory hits with source locators."""
         if not 1 <= top_k <= 50:
             raise ClientError("top-k must be 1-50.", "validation", "Use the default value 8.")
-        payload: dict[str, Any] = {"query": _validate_query(query), "top_k": top_k}
+        retrieval_mode = _validate_retrieval_mode(retrieval_mode)
+        payload: dict[str, Any] = {
+            "query": _validate_query(query),
+            "top_k": top_k,
+            "retrieval_mode": retrieval_mode,
+        }
         selected = _validate_scopes(scopes)
         if selected is not None:
             payload["scopes"] = selected
@@ -228,6 +250,7 @@ class MemoryClient:
         scopes: Sequence[str] | None,
         top_k: int,
         char_budget: int,
+        retrieval_mode: str = "hybrid",
     ) -> dict[str, Any]:
         """Build a compact cited context bundle for an Agent prompt."""
         if not 1 <= top_k <= 50:
@@ -236,10 +259,12 @@ class MemoryClient:
             raise ClientError(
                 "char-budget must be 200-30000.", "validation", "Use the default value 6000."
             )
+        retrieval_mode = _validate_retrieval_mode(retrieval_mode)
         payload: dict[str, Any] = {
             "query": _validate_query(query),
             "top_k": top_k,
             "char_budget": char_budget,
+            "retrieval_mode": retrieval_mode,
         }
         selected = _validate_scopes(scopes)
         if selected is not None:
@@ -308,6 +333,9 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("query")
         command.add_argument("--scopes", nargs="+", choices=SCOPES)
         command.add_argument("--top-k", type=int, default=8)
+        command.add_argument(
+            "--retrieval-mode", choices=RETRIEVAL_MODES, default="hybrid"
+        )
         if name == "context":
             command.add_argument("--char-budget", type=int, default=6000)
 
@@ -381,6 +409,8 @@ def _diagnostics(client: MemoryClient) -> dict[str, Any]:
             "diagnostics",
         ],
         "scopes": list(SCOPES),
+        "retrieval_modes": list(RETRIEVAL_MODES),
+        "automatic_hook_mode": "local",
         "harness_features": {
             "input_validation": True,
             "output_sanity": True,
@@ -401,9 +431,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "status":
             result = client.status()
         elif args.command == "search":
-            result = client.search(args.query, args.scopes, args.top_k)
+            result = client.search(
+                args.query, args.scopes, args.top_k, args.retrieval_mode
+            )
         elif args.command == "context":
-            result = client.context(args.query, args.scopes, args.top_k, args.char_budget)
+            result = client.context(
+                args.query,
+                args.scopes,
+                args.top_k,
+                args.char_budget,
+                args.retrieval_mode,
+            )
         elif args.command == "sync":
             result = client.sync(args.scopes)
         elif args.command == "propose":
