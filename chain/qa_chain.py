@@ -140,6 +140,34 @@ class QAChain:
 
         return answer, docs
 
+    def stream_answer_with_documents(
+        self,
+        question: str,
+        docs: List[Document],
+    ):
+        """使用预先检索好的文档流式生成答案（用于混合检索模式的打字机效果）。
+
+        Yields:
+            Tuple[str, Optional[List[Document]]]:
+              - 过程中: (当前累积答案, None)
+              - 最后一次: (完整答案, 引用文档列表)
+        """
+        if not docs:
+            messages = self.no_context_prompt.format_messages(question=question)
+        else:
+            context = self.retriever.format_context(docs)
+            messages = self.qa_prompt.format_messages(
+                context=context,
+                question=question,
+            )
+
+        full_answer = ""
+        for chunk in self.llm.stream(messages):
+            full_answer += chunk.content
+            yield full_answer, None
+
+        yield full_answer, docs
+
     def _multi_query_retrieve(
         self,
         queries: List[str],

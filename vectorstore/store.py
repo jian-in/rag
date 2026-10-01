@@ -135,6 +135,31 @@ class VectorStoreManager:
             collection.delete(ids=all_ids)
         print(f"✅ 已清空向量数据库（删除了 {len(all_ids)} 个向量）")
 
+    def delete_by_metadata(self, where: dict) -> int:
+        """
+        按元数据条件删除文档（用于删除某个来源/课程的文档）
+
+        Args:
+            where: ChromaDB 的 where 过滤条件，例如 {"course_id": "c1"}
+
+        Returns:
+            int: 实际删除的向量数量
+
+        Raises:
+            RuntimeError: 如果向量数据库尚未初始化
+        """
+        if self.vectorstore is None:
+            raise RuntimeError("向量数据库未初始化")
+        if not where:
+            raise ValueError("delete_by_metadata 需要非空的 where 过滤条件")
+
+        collection = self.vectorstore._collection
+        matched = collection.get(where=where).get("ids", [])
+        if matched:
+            collection.delete(where=where)
+        print(f"✅ 按条件删除向量: {where} → 删除了 {len(matched)} 个")
+        return len(matched)
+
     def get_vectorstore(self) -> Chroma:
         """
         获取向量数据库实例

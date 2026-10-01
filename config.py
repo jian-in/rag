@@ -25,9 +25,9 @@ LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))  # RAG 场景建议�
 # Embedding 配置（支持独立于 LLM 的 API 端点）
 # ============================================================
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "") or SILICONFLOW_API_KEY or OPENAI_API_KEY  # ????????? Embedding Key
-EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "https://api.siliconflow.cn/v1")  # ?????Embedding API ???
-EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "1024"))  # ???????????????
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "") or SILICONFLOW_API_KEY or OPENAI_API_KEY  # 独立的 Embedding Key，缺省回退到硅基流动或 OpenAI Key
+EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "https://api.siliconflow.cn/v1")  # 独立的 Embedding API 端点
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "1024"))  # Embedding 向量维度
 
 # ============================================================
 # 多模态视觉模型配置
@@ -60,7 +60,12 @@ RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
 #   - 0.5-0.7 通常是较好的平衡点
 MMR_LAMBDA = float(os.getenv("MMR_LAMBDA", "0.6"))
 
-# ???????
+# 混合检索的融合策略
+#   - "rrf"：倒数排名融合（只看排名，不受分数量纲影响，鲁棒，推荐）
+#   - "weighted"：加权融合（保留归一化后的分数强度，对参数更敏感）
+HYBRID_FUSION_STRATEGY = os.getenv("HYBRID_FUSION_STRATEGY", "rrf").lower()
+
+# 是否启用重排序
 ENABLE_RERANKER = os.getenv("ENABLE_RERANKER", "false").lower() == "true"
 _DEFAULT_RERANKER_MODELS = {
     "cohere": "rerank-multilingual-v3.0",
@@ -78,14 +83,14 @@ if not RERANKER_PROVIDER:
         RERANKER_MODEL_NAME = _RERANKER_MODEL_ENV
 else:
     RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", _RERANKER_MODEL_ENV)
-RERANKER_TOP_N = int(os.getenv("RERANKER_TOP_N", "3"))  # ??????????
+RERANKER_TOP_N = int(os.getenv("RERANKER_TOP_N", "3"))  # 重排序后保留的文档数
 RERANKER_API_BASE = os.getenv("RERANKER_API_BASE", "https://api.siliconflow.cn/v1")
 RERANKER_API_KEY = os.getenv("RERANKER_API_KEY", "") or SILICONFLOW_API_KEY
 RERANKER_MAX_CHUNKS_PER_DOC = int(os.getenv("RERANKER_MAX_CHUNKS_PER_DOC", "1024"))
 RERANKER_OVERLAP_TOKENS = int(os.getenv("RERANKER_OVERLAP_TOKENS", "60"))
 
 # ============================================================
-# ???????
+# 向量数据库配置
 # ============================================================
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "knowledge_base")

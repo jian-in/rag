@@ -8,6 +8,7 @@ import os
 import traceback
 import uuid
 from typing import Any, AsyncIterator, Dict, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -180,6 +181,23 @@ class HTTPMCPServer:
 
 server = HTTPMCPServer()
 app = FastAPI(title="RAG MCP HTTP Server", version=SERVER_VERSION)
+
+# 允许的 Host 头主机名（含任意端口）。
+# 防 DNS Rebinding：攻击者把自己的域名解析到 127.0.0.1，浏览器发出的 Host
+# 仍是攻击者域名，因此校验 Host 而不是 Origin（同源请求不带 Origin）。
+_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+@app.middleware("http")
+async def enforce_trusted_host(request: Request, call_next):
+    # Host 形如 "127.0.0.1:8766" 或 "[::1]:8766"，补上 scheme 才能正确解析
+    hostname = (urlsplit("//" + request.headers.get("host", "")).hostname or "").lower()
+    if hostname not in _ALLOWED_HOSTNAMES:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "forbidden: untrusted Host header"},
+        )
+    return await call_next(request)
 
 
 @app.get("/health")

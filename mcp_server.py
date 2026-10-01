@@ -74,6 +74,8 @@ class KnowledgeRuntime:
         self.doc_count = 0
         self.vector_count = 0
         self.sync_lock = threading.Lock()
+        # (source, page) -> {chunk_index: Document} for parent-window expansion
+        self._chunks_by_doc: Dict[tuple, Dict[int, Document]] = {}
 
     def _load_chunks_from_vectorstore(
         self,
@@ -125,7 +127,23 @@ class KnowledgeRuntime:
         self.doc_count = len(chunks)
         self.vector_count = manager.count()
         self.load_warning = warning
+        self._build_chunk_index(chunks)
         self.loaded = True
+
+    def _build_chunk_index(self, chunks: List[Document]) -> None:
+        """Group chunks by (source, page) so hits can be expanded with neighbours."""
+        index: Dict[tuple, Dict[int, Document]] = {}
+        for doc in chunks:
+            chunk_index = doc.metadata.get("chunk_index")
+            if chunk_index is None:
+                continue
+            try:
+                chunk_index = int(chunk_index)
+            except (TypeError, ValueError):
+                continue
+            key = (doc.metadata.get("source", ""), doc.metadata.get("page", ""))
+            index.setdefault(key, {})[chunk_index] = doc
+        self._chunks_by_doc = index
 
     def ensure_loaded(self) -> None:
         if self.loaded:
@@ -155,6 +173,7 @@ class KnowledgeRuntime:
         self.qa_chain = None
         self.doc_count = 0
         self.vector_count = 0
+        self._chunks_by_doc = {}
         self.ensure_loaded()
         return self.status()
 
@@ -223,11 +242,75 @@ class KnowledgeRuntime:
             "page": metadata.get("page", ""),
             "chunk_index": metadata.get("chunk_index", ""),
             "chunk_total": metadata.get("chunk_total", ""),
+            "window_start": metadata.get("window_start"),
+            "window_end": metadata.get("window_end"),
             "bm25_score": metadata.get("bm25_score"),
             "rrf_score": metadata.get("rrf_score"),
             "rerank_score": metadata.get("rerank_score"),
             "preview": doc.page_content[:400],
         }
+
+    def _expand_with_neighbors(
+        self,
+        docs: List[Any],
+        window: int,
+    ) -> List[Any]:
+        """Parent-window expansion: merge each hit with +/-window neighbouring chunks.
+
+        Overlapping windows from the same (source, page) are merged so the LLM
+        never sees duplicated content. Chunks without index metadata pass through.
+        """
+        if window <= 0 or not docs:
+            return docs
+
+        expanded: List[Any] = []
+        for doc in docs:
+            metadata = doc.metadata
+            key = (metadata.get("source", ""), metadata.get("page", ""))
+            chunk_index = metadata.get("chunk_index")
+            try:
+                chunk_index = int(chunk_index)
+            except (TypeError, ValueError):
+                chunk_index = None
+            siblings = self._chunks_by_doc.get(key) if chunk_index is not None else None
+
+            if not siblings:
+                expanded.append(doc)
+                continue
+
+            start = max(1, chunk_index - window)
+            end = chunk_index + window
+
+            # Merge with the previous expanded doc if it covers the same file
+            # and the ranges touch (keeps output free of duplicated text).
+            if expanded:
+                prev = expanded[-1]
+                pm = prev.metadata
+                pkey = (pm.get("source", ""), pm.get("page", ""))
+                if pkey == key and pm.get("window_end") is not None and start <= pm["window_end"] + 1:
+                    if end > pm["window_end"]:
+                        psibs = self._chunks_by_doc.get(pkey, {})
+                        lo, hi = pm["window_end"] + 1, end
+                        extra = "\n\n".join(
+                            psibs[i].page_content for i in range(lo, hi + 1) if i in psibs
+                        )
+                        prev.page_content = prev.page_content + ("\n\n" + extra if extra else "")
+                        prev.metadata = {**pm, "window_end": end}
+                    continue
+
+            parts = [siblings[i].page_content for i in range(start, end + 1) if i in siblings]
+            expanded.append(
+                Document(
+                    page_content="\n\n".join(parts),
+                    metadata={
+                        **metadata,
+                        "window_start": start,
+                        "window_end": end,
+                        "expanded": True,
+                    },
+                )
+            )
+        return expanded
 
     def _retrieve_docs(
         self,
@@ -258,6 +341,13 @@ class KnowledgeRuntime:
                     if key not in seen:
                         seen.add(key)
                         all_docs.append(doc)
+            # Global re-rank of the merged candidate pool with the ORIGINAL query.
+            # Without this, naive concatenation + truncation keeps mostly the first
+            # rewritten query's hits and silently drops better candidates from the rest.
+            reranker = getattr(self.vector_retriever, "reranker", None)
+            if reranker is not None and len(all_docs) > top_k:
+                with redirect_stdout_to_stderr():
+                    return reranker.rerank(query, all_docs, top_n=top_k)
             return all_docs[:top_k]
 
         with redirect_stdout_to_stderr():
@@ -285,6 +375,7 @@ class KnowledgeRuntime:
         top_k: int = 5,
         use_hybrid: bool = True,
         rewrite_strategy: Optional[str] = None,
+        window: int = 0,
     ) -> Dict[str, Any]:
         docs = self._retrieve_docs(
             query=query,
@@ -292,10 +383,12 @@ class KnowledgeRuntime:
             use_hybrid=use_hybrid,
             rewrite_strategy=rewrite_strategy,
         )
+        docs = self._expand_with_neighbors(docs, window)
         return {
             "query": query,
             "use_hybrid": use_hybrid,
             "rewrite_strategy": rewrite_strategy,
+            "window": window,
             "result_count": len(docs),
             "results": [self._serialize_doc(doc) for doc in docs],
         }
@@ -306,6 +399,7 @@ class KnowledgeRuntime:
         top_k: int = 5,
         use_hybrid: bool = True,
         rewrite_strategy: Optional[str] = None,
+        window: int = 0,
     ) -> Dict[str, Any]:
         self.ensure_loaded()
         assert self.qa_chain is not None
@@ -315,6 +409,7 @@ class KnowledgeRuntime:
             use_hybrid=use_hybrid,
             rewrite_strategy=rewrite_strategy,
         )
+        docs = self._expand_with_neighbors(docs, window)
         with redirect_stdout_to_stderr():
             answer, cited_docs = self.qa_chain.answer_with_documents(question, docs)
         return {
@@ -322,6 +417,7 @@ class KnowledgeRuntime:
             "answer": answer,
             "use_hybrid": use_hybrid,
             "rewrite_strategy": rewrite_strategy,
+            "window": window,
             "sources": [self._serialize_doc(doc) for doc in cited_docs],
         }
 
@@ -339,6 +435,13 @@ class MCPServer:
             {
                 "name": "get_status",
                 "description": "Load and return knowledge base status, model settings, and index readiness.",
+                "annotations": {
+                    "title": "Get knowledge base status",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -348,6 +451,13 @@ class MCPServer:
             {
                 "name": "reload_knowledge_base",
                 "description": "Reload the persisted Chroma index and rebuild the BM25 cache from the local data directory.",
+                "annotations": {
+                    "title": "Reload knowledge base",
+                    "readOnlyHint": False,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -357,6 +467,13 @@ class MCPServer:
             {
                 "name": "sync_knowledge_base",
                 "description": "Mirror selected SecondBrain folders and incrementally synchronize added, changed, and deleted files into Chroma and BM25.",
+                "annotations": {
+                    "title": "Sync knowledge base",
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -365,7 +482,14 @@ class MCPServer:
             },
             {
                 "name": "search_knowledge",
-                "description": "Search the local RAG knowledge base. Use this when the user asks for facts from the configured documents.",
+                "description": "Search the local RAG knowledge base. Use this when the user asks for facts from the configured documents. Pass window=1 when a hit's surrounding chunks matter.",
+                "annotations": {
+                    "title": "Search knowledge base",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -387,6 +511,13 @@ class MCPServer:
                             "default": None,
                             "description": "Optional query rewriting strategy before retrieval.",
                         },
+                        "window": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 3,
+                            "default": 0,
+                            "description": "Parent-window expansion: 0 = off; N = merge each hit with up to N neighbouring chunks on both sides for fuller context.",
+                        },
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -394,7 +525,14 @@ class MCPServer:
             },
             {
                 "name": "ask_knowledge",
-                "description": "Answer a question using the local RAG knowledge base and cite supporting chunks. Use this before saying the knowledge base has no relevant content.",
+                "description": "Answer a question using the local RAG knowledge base and cite supporting chunks. Use this before saying the knowledge base has no relevant content. Pass window=1 to give the answerer neighbouring chunks as context.",
+                "annotations": {
+                    "title": "Ask knowledge base",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -415,6 +553,13 @@ class MCPServer:
                             "enum": [None, "expand", "decompose", "hyde"],
                             "default": None,
                             "description": "Optional query rewriting strategy before retrieval.",
+                        },
+                        "window": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 3,
+                            "default": 0,
+                            "description": "Parent-window expansion: 0 = off; N = merge each hit with up to N neighbouring chunks on both sides for fuller context.",
                         },
                     },
                     "required": ["question"],
@@ -523,6 +668,7 @@ class MCPServer:
                     top_k=top_k,
                     use_hybrid=bool(arguments.get("use_hybrid", True)),
                     rewrite_strategy=arguments.get("rewrite_strategy"),
+                    window=int(arguments.get("window", 0)),
                 )
             )
         if name == "ask_knowledge":
@@ -536,6 +682,7 @@ class MCPServer:
                     top_k=top_k,
                     use_hybrid=bool(arguments.get("use_hybrid", True)),
                     rewrite_strategy=arguments.get("rewrite_strategy"),
+                    window=int(arguments.get("window", 0)),
                 )
             )
         raise MCPError(f"Unknown tool: {name}")

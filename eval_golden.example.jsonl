@@ -1,0 +1,7 @@
+# Golden set template — copy to eval_golden.jsonl and replace with questions from YOUR notes.
+# One JSON object per line: {"question": "...", "expect": "..."}
+#   question: a real question you would ask the knowledge base
+#   expect:   a substring of the source path of the note that contains the answer
+#             (e.g. "02-Areas/Invest" or "HippoRAG"; matched against result source paths)
+{"question": "示例：我的 OCR 工具装在哪个盘？", "expect": "Tesseract"}
+{"question": "示例：最近拆解的 REALM 论文核心思想是什么？", "expect": "REALM"}

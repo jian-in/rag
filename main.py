@@ -15,12 +15,20 @@ RAG 知识库问答系统 - 主入口
 import os
 import sys
 import tempfile
+import traceback
+
+# Windows GBK 控制台编码修复：强制 stdout/stderr 用 UTF-8
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 import shutil
 from typing import List, Tuple
 import gradio as gr
 # 将项目根目录加入 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+from ui_styles import CUSTOM_CSS, CUSTOM_THEME
 from ingestion.loader import DocumentLoader
 from ingestion.splitter import TextSplitter
 from vectorstore.store import VectorStoreManager
@@ -28,6 +36,7 @@ from retrieval.retriever import SmartRetriever
 from retrieval.reranker import Reranker
 from retrieval.query_rewriter import QueryRewriter
 from retrieval.hybrid_retriever import BM25Retriever, HybridRetriever
+from langchain_core.documents import Document
 from retrieval.conversation_memory import ConversationMemory
 from chain.qa_chain import QAChain
 from chain.langgraph_workflow import RAGWorkflow
@@ -167,7 +176,78 @@ def build_knowledge_base(files: List[str]) -> str:
         )
 
     except Exception as e:
+        traceback.print_exc()
         return f"❌ 构建失败: {str(e)}"
+
+
+def auto_load_knowledge_base():
+    """启动时自动加载已有的 ChromaDB 知识库"""
+    if not os.path.exists(config.CHROMA_PERSIST_DIR):
+        print("[auto-load] 未检测到已有知识库，跳过")
+        return False
+
+    try:
+        print("[auto-load] 正在加载已有知识库...")
+
+        # 1. 加载 ChromaDB
+        app_state.vectorstore_manager = VectorStoreManager()
+        vectorstore = app_state.vectorstore_manager.load()
+
+        # 2. 从 ChromaDB 获取所有文档块（用于 BM25 索引）
+        collection = vectorstore._collection
+        result = collection.get(include=["documents", "metadatas"])
+
+        chunks = []
+        for i, doc_id in enumerate(result.get("ids", [])):
+            content = result["documents"][i] if i < len(result.get("documents", [])) else ""
+            metadata = result["metadatas"][i] if i < len(result.get("metadatas", [])) else {}
+            if content:
+                chunks.append(Document(page_content=content, metadata=metadata))
+
+        if not chunks:
+            print("[auto-load] 知识库为空")
+            return False
+
+        # 3. 初始化检索器
+        reranker = None
+        if config.ENABLE_RERANKER:
+            try:
+                reranker = Reranker()
+            except Exception as e:
+                print(f"[auto-load] 重排序器初始化失败: {e}")
+
+        retriever = SmartRetriever(vectorstore=vectorstore, reranker=reranker)
+        app_state.qa_chain = QAChain(retriever=retriever)
+
+        # 4. 构建 BM25 索引
+        app_state.bm25_retriever = BM25Retriever()
+        app_state.bm25_retriever.build_index(chunks)
+
+        # 5. 初始化混合检索器
+        app_state.hybrid_retriever = HybridRetriever(
+            bm25_retriever=app_state.bm25_retriever,
+            vector_retriever=retriever,
+        )
+
+        # 6. 初始化其他组件
+        app_state.memory = ConversationMemory()
+        app_state.workflow = RAGWorkflow(
+            retriever=retriever,
+            hybrid_retriever=app_state.hybrid_retriever,
+            query_rewriter=QueryRewriter(),
+            memory=app_state.memory,
+        )
+
+        app_state._chunks = chunks
+        app_state.doc_count = len(chunks)
+        app_state.status = "已就绪"
+
+        print(f"[auto-load] 知识库加载完成，共 {len(chunks)} 个文本块")
+        return True
+
+    except Exception as e:
+        print(f"[auto-load] 加载失败: {e}")
+        return False
 
 
 def clear_knowledge_base() -> str:
@@ -201,7 +281,106 @@ def clear_knowledge_base() -> str:
         )
 
     except Exception as e:
+        traceback.print_exc()
         return f"❌ 清空失败: {str(e)}"
+
+
+def kb_add_documents(items: List[dict], course_id: str, origin: str = "kece") -> dict:
+    """
+    将外部资料（如课策上传的课程文档）增量写入知识库，并同步重建 BM25 索引。
+
+    每个 chunk 会打上 course_id / doc_id / origin 标记，便于后续按课程或文档删除。
+
+    Args:
+        items: 文档列表，每项 {"doc_id": str, "name": str, "text": str}
+        course_id: 课程标识（用于后续按课程删除）
+        origin: 来源标记，默认 "kece"
+
+    Returns:
+        dict: {"added_chunks": int, "doc_count": int}
+
+    Raises:
+        RuntimeError: 知识库尚未初始化（需先构建或加载）
+    """
+    if app_state.vectorstore_manager is None or app_state.bm25_retriever is None:
+        raise RuntimeError("知识库尚未初始化，请先构建或加载知识库")
+
+    course_id = str(course_id)
+    raw_docs: List[Document] = []
+    for i, it in enumerate(items or []):
+        text = (it.get("text") or "").strip()
+        if not text:
+            continue
+        doc_id = str(it.get("doc_id") or it.get("id") or f"auto-{i}")
+        name = str(it.get("name") or f"课程文档-{doc_id}")
+        raw_docs.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "source": f"kece::{course_id}::{doc_id}",
+                    "file_name": name,
+                    "course_id": course_id,
+                    "doc_id": doc_id,
+                    "origin": str(origin),
+                },
+            )
+        )
+
+    if not raw_docs:
+        return {"added_chunks": 0, "doc_count": app_state.doc_count}
+
+    chunks = app_state.splitter.split_documents(raw_docs)
+    app_state.vectorstore_manager.add_documents(chunks)
+
+    # 同步 _chunks 并重建 BM25（否则新内容只在向量侧可见）
+    app_state._chunks.extend(chunks)
+    app_state.bm25_retriever.build_index(app_state._chunks)
+    app_state.doc_count = len(app_state._chunks)
+
+    print(f"✅ [kb-add] course_id={course_id} 写入 {len(chunks)} 个块，当前总量 {app_state.doc_count}")
+    return {"added_chunks": len(chunks), "doc_count": app_state.doc_count}
+
+
+def kb_delete_documents(course_id: str = None, doc_id: str = None) -> dict:
+    """
+    按课程/文档从知识库删除文档，并同步重建 BM25 索引。
+
+    Args:
+        course_id: 按课程删除（删除该课程的全部文档）
+        doc_id: 按单个文档删除；与 course_id 同时提供时两者都匹配
+
+    Returns:
+        dict: {"deleted": int, "doc_count": int}
+    """
+    if app_state.vectorstore_manager is None:
+        raise RuntimeError("知识库尚未初始化")
+    if not course_id and not doc_id:
+        raise ValueError("需要提供 course_id 或 doc_id 至少一个")
+
+    conds = []
+    if course_id:
+        conds.append({"course_id": str(course_id)})
+    if doc_id:
+        conds.append({"doc_id": str(doc_id)})
+    where = conds[0] if len(conds) == 1 else {"$and": conds}
+
+    deleted = app_state.vectorstore_manager.delete_by_metadata(where)
+
+    # 同步 _chunks
+    def _match(md: dict) -> bool:
+        if course_id and str(md.get("course_id")) != str(course_id):
+            return False
+        if doc_id and str(md.get("doc_id")) != str(doc_id):
+            return False
+        return True
+
+    app_state._chunks = [c for c in app_state._chunks if not _match(c.metadata)]
+    if app_state.bm25_retriever is not None and app_state._chunks:
+        app_state.bm25_retriever.build_index(app_state._chunks)
+    app_state.doc_count = len(app_state._chunks)
+
+    print(f"✅ [kb-delete] where={where} 删除 {deleted} 个，当前总量 {app_state.doc_count}")
+    return {"deleted": deleted, "doc_count": app_state.doc_count}
 
 
 def run_quick_eval(question: str, ground_truth: str) -> str:
@@ -270,6 +449,7 @@ def run_quick_eval(question: str, ground_truth: str) -> str:
     except ImportError:
         return "⚠️ 请先安装 ragas: `pip install ragas datasets`"
     except Exception as e:
+        traceback.print_exc()
         return f"❌ 评估失败: {str(e)}"
 
 
@@ -369,18 +549,20 @@ def answer_question(
         return answer, source_info
 
     except Exception as e:
+        traceback.print_exc()
         return f"❌ 回答失败: {str(e)}", ""
 
 
 def stream_answer_question(
     question: str,
     use_memory: bool = False,
+    use_hybrid: bool = False,
 ):
     """
     流式回答（打字机效果）
 
-    标准模式下逐 token 输出，提供实时打字效果。
-    对于混合检索和 LangGraph 模式，仍使用非流式。
+    标准模式与混合检索模式均逐 token 输出，提供实时打字效果。
+    LangGraph 多节点工作流仍使用非流式。
 
     Yields:
         Tuple[str, str]: (当前累积答案, 来源信息)
@@ -399,11 +581,21 @@ def stream_answer_question(
         if use_memory and app_state.memory:
             actual_query = app_state.memory.rewrite_query_with_history(question)
 
-        # 使用 stream_answer 流式输出
         source_info = "⏳ 正在检索相关文档..."
         full_answer = ""
 
-        for partial, docs in app_state.qa_chain.stream_answer(actual_query):
+        if use_hybrid and app_state.hybrid_retriever:
+            # 混合检索：先检索再流式生成
+            yield "", "⏳ 正在混合检索（BM25 + 向量召回 → RRF 融合）..."
+            docs = app_state.hybrid_retriever.search(actual_query, top_k=config.RETRIEVAL_TOP_K)
+            source_info = _format_sources(docs)
+            yield "⏳ 检索完成，正在生成答案...", source_info
+            stream_iter = app_state.qa_chain.stream_answer_with_documents(actual_query, docs)
+        else:
+            # 标准模式：检索 + 流式生成
+            stream_iter = app_state.qa_chain.stream_answer(actual_query)
+
+        for partial, docs in stream_iter:
             full_answer = partial
             if docs is not None:
                 source_info = _format_sources(docs)
@@ -421,6 +613,7 @@ def stream_answer_question(
             yield final, source_info
 
     except Exception as e:
+        traceback.print_exc()
         yield f"❌ 回答失败: {str(e)}", ""
 
 
@@ -469,6 +662,7 @@ def answer_with_image(
         return final_answer, source_info
 
     except Exception as e:
+        traceback.print_exc()
         return f"❌ 图像分析失败: {str(e)}", ""
 
 
@@ -556,254 +750,7 @@ def get_status() -> str:
 # ============================================================
 # 自定义主题与样式
 # ============================================================
-
-CUSTOM_CSS = """
-/* ===== 全局暗色样式 ===== */
-.gradio-container {
-    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif !important;
-    max-width: 1280px !important;
-    margin: 0 auto !important;
-    background: #0f1117 !important;
-    min-height: 100vh;
-    padding: 16px !important;
-    color: #e2e8f0 !important;
-}
-
-/* ===== 顶部标题区域 ===== */
-.header-section {
-    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 50%, #a855f7 100%);
-    border-radius: 20px;
-    padding: 32px 40px;
-    margin-bottom: 20px;
-    color: white;
-    box-shadow: 0 8px 32px rgba(79, 70, 229, 0.25);
-    position: relative;
-    overflow: hidden;
-}
-.header-section::before {
-    content: '';
-    position: absolute;
-    top: -50%;
-    right: -20%;
-    width: 300px;
-    height: 300px;
-    background: rgba(255,255,255,0.06);
-    border-radius: 50%;
-}
-.header-section::after {
-    content: '';
-    position: absolute;
-    bottom: -30%;
-    left: 10%;
-    width: 200px;
-    height: 200px;
-    background: rgba(255,255,255,0.04);
-    border-radius: 50%;
-}
-.header-section h1 {
-    margin: 0 0 8px 0;
-    font-size: 1.8em;
-    font-weight: 800;
-    letter-spacing: -0.5px;
-    position: relative;
-    z-index: 1;
-}
-.header-section p {
-    margin: 0;
-    opacity: 0.85;
-    font-size: 0.95em;
-    font-weight: 400;
-    position: relative;
-    z-index: 1;
-}
-
-/* ===== 标签页 (胶囊风格 暗色) ===== */
-.tab-nav {
-    display: flex !important;
-    gap: 4px !important;
-    background: #1a1c2e !important;
-    border-radius: 16px !important;
-    padding: 6px !important;
-    margin-bottom: 20px !important;
-    border: 1px solid #2d2f45 !important;
-}
-.tab-nav button {
-    border-radius: 12px !important;
-    border: none !important;
-    padding: 12px 24px !important;
-    font-size: 0.95em !important;
-    font-weight: 600 !important;
-    color: #8b8fa3 !important;
-    background: transparent !important;
-    transition: all 0.3s ease !important;
-}
-.tab-nav button:hover {
-    background: #252740 !important;
-    color: #a78bfa !important;
-}
-.tab-nav button.selected {
-    background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
-    color: white !important;
-    box-shadow: 0 4px 16px rgba(79, 70, 229, 0.3) !important;
-}
-
-/* ===== 聊天气泡 ===== */
-.bot {
-    background: #1e2035 !important;
-    border: 1px solid #2d2f45 !important;
-    border-radius: 16px 16px 16px 4px !important;
-    color: #e2e8f0 !important;
-    padding: 16px 20px !important;
-}
-.user {
-    background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
-    color: white !important;
-    border-radius: 16px 16px 4px 16px !important;
-    box-shadow: 0 4px 16px rgba(79, 70, 229, 0.25) !important;
-    padding: 16px 20px !important;
-}
-
-/* 聊天框容器 */
-[class*="chatbot"] {
-    border-radius: 20px !important;
-    border: 1px solid #2d2f45 !important;
-    background: #13141f !important;
-}
-
-/* ===== 输入框 ===== */
-textarea, input[type="text"] {
-    background: #1a1c2e !important;
-    border: 2px solid #2d2f45 !important;
-    border-radius: 14px !important;
-    color: #e2e8f0 !important;
-    transition: all 0.3s ease !important;
-    padding: 12px 18px !important;
-}
-textarea:focus, input[type="text"]:focus {
-    border-color: #6366f1 !important;
-    box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.15) !important;
-    outline: none !important;
-    background: #1e2035 !important;
-}
-
-/* ===== 按钮 ===== */
-.primary {
-    background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
-    border: none !important;
-    border-radius: 14px !important;
-    font-weight: 600 !important;
-    color: white !important;
-    padding: 12px 28px !important;
-    box-shadow: 0 4px 16px rgba(79, 70, 229, 0.3) !important;
-    transition: all 0.3s ease !important;
-}
-.primary:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 6px 24px rgba(79, 70, 229, 0.4) !important;
-}
-
-/* ===== 面板和区块 ===== */
-[class*="block"] {
-    border-radius: 16px !important;
-    border-color: #2d2f45 !important;
-}
-
-/* Markdown 区域 */
-.markdown {
-    border-radius: 16px !important;
-    color: #cbd5e1 !important;
-}
-
-/* 代码块 */
-code {
-    background: #1a1c2e !important;
-    color: #a78bfa !important;
-    border-radius: 8px !important;
-    font-family: 'JetBrains Mono', 'Consolas', monospace !important;
-}
-pre {
-    background: #1a1c2e !important;
-    border: 1px solid #2d2f45 !important;
-    border-radius: 12px !important;
-    color: #e2e8f0 !important;
-    font-family: 'JetBrains Mono', 'Consolas', monospace !important;
-}
-
-/* ===== Checkbox ===== */
-input[type="checkbox"] {
-    accent-color: #6366f1 !important;
-}
-
-/* ===== 文件上传区域 ===== */
-[class*="upload"] {
-    border: 2px dashed #3d3f5c !important;
-    border-radius: 16px !important;
-    background: #13141f !important;
-    transition: all 0.3s ease !important;
-}
-[class*="upload"]:hover {
-    border-color: #6366f1 !important;
-    background: #1a1c2e !important;
-}
-
-/* ===== 表格 ===== */
-table {
-    border-radius: 12px !important;
-    overflow: hidden !important;
-    border: 1px solid #2d2f45 !important;
-    background: #1a1c2e !important;
-}
-th {
-    background: #252740 !important;
-    font-weight: 600 !important;
-    color: #a78bfa !important;
-}
-td {
-    border-top: 1px solid #2d2f45 !important;
-    color: #cbd5e1 !important;
-}
-
-/* ===== 下拉框 / 选择器 ===== */
-select, [role="listbox"] {
-    background: #1a1c2e !important;
-    border: 1px solid #2d2f45 !important;
-    color: #e2e8f0 !important;
-    border-radius: 12px !important;
-}
-
-/* ===== 滚动条 ===== */
-::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-}
-::-webkit-scrollbar-track {
-    background: #13141f;
-}
-::-webkit-scrollbar-thumb {
-    background: #3d3f5c;
-    border-radius: 4px;
-}
-::-webkit-scrollbar-thumb:hover {
-    background: #4f46e5;
-}
-
-/* ===== 动画 ===== */
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-.header-section {
-    animation: fadeIn 0.6s ease-out;
-}
-"""
-
-CUSTOM_THEME = gr.themes.Soft(
-    primary_hue=gr.themes.colors.indigo,
-    secondary_hue=gr.themes.colors.purple,
-    neutral_hue=gr.themes.colors.slate,
-    font=[gr.themes.GoogleFont("Inter"), "Segoe UI", "Microsoft YaHei", "sans-serif"],
-    font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "Consolas", "monospace"],
-)
+# CUSTOM_CSS 与 CUSTOM_THEME 已抽离到 ui_styles.py，此处直接从模块导入使用。
 
 
 # ============================================================
@@ -904,21 +851,33 @@ def create_app() -> gr.Blocks:
                         chat_history[-1] = {"role": "assistant", "content": answer}
                         yield "", None, chat_history, sources
 
-                    elif hybrid or langgraph:
-                        # 混合检索或 LangGraph 模式：非流式
+                    elif langgraph:
+                        # LangGraph 工作流：多节点（分析→检索→生成→质检），非流式
                         user_content = question
                         chat_history.append({"role": "user", "content": user_content})
                         chat_history.append({"role": "assistant", "content": ""})
-                        yield "", None, chat_history, "⏳ 正在检索..."
+                        yield "", None, chat_history, "⏳ LangGraph 工作流运行中（分析查询 → 检索 → 生成 → 质量检查）..."
 
                         answer, sources = answer_question(
                             question, chat_history,
                             use_hybrid=hybrid,
                             use_memory=memory,
-                            use_langgraph=langgraph,
+                            use_langgraph=True,
                         )
                         chat_history[-1] = {"role": "assistant", "content": answer}
                         yield "", None, chat_history, sources
+
+                    elif hybrid:
+                        # 混合检索模式：先检索再流式生成（打字机效果）
+                        user_content = question
+                        chat_history.append({"role": "user", "content": user_content})
+                        chat_history.append({"role": "assistant", "content": ""})
+
+                        for partial_answer, sources in stream_answer_question(
+                            question, use_memory=memory, use_hybrid=True
+                        ):
+                            chat_history[-1] = {"role": "assistant", "content": partial_answer}
+                            yield "", None, chat_history, sources
 
                     else:
                         # 标准模式：流式输出（打字机效果）
@@ -1094,8 +1053,11 @@ if __name__ == "__main__":
     app = create_app()
 
     # 创建 FastAPI 并挂载到同一个服务上
-    fastapi_app = create_api(app_state)
+    fastapi_app = create_api(app_state, kb_add_documents, kb_delete_documents)
     app = gr.mount_gradio_app(fastapi_app, app, path="/")
+
+    # 启动时自动加载已有知识库
+    auto_load_knowledge_base()
 
     # 启动（API 文档访问: http://localhost:7860/docs）
     import uvicorn

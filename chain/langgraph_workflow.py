@@ -24,6 +24,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
 import config
+from chain.prompts import SYSTEM_PROMPT, QA_PROMPT_TEMPLATE
 
 
 # ============================================================
@@ -90,6 +91,7 @@ class RAGWorkflow:
         self.hybrid_retriever = hybrid_retriever
         self.query_rewriter = query_rewriter
         self.memory = memory
+        self._compiled_graph = None  # 编译后的图缓存，避免每次 run 重复编译
 
         llm_kwargs = {
             "model": config.LLM_MODEL_NAME,
@@ -215,32 +217,20 @@ class RAGWorkflow:
             context_parts.append("[文档 " + str(i) + "] 来源: " + source + "\n" + doc["content"])
         context = "\n\n---\n\n".join(context_parts)
 
-        # 对话历史
+        # 对话历史（作为补充上下文追加到文档后）
         conversation_ctx = state.get("conversation_context", "")
-        history_hint = ""
         if conversation_ctx:
-            history_hint = "\n\n对话历史参考：\n" + conversation_ctx
+            context = context + "\n\n对话历史参考：\n" + conversation_ctx
 
         query = state["rewritten_query"]
-        template = (
-            "请根据以下知识库文档来回答用户的问题。\n\n"
-            "## 知识库文档\n\n"
-            + context +
-            history_hint + "\n\n"
-            "## 用户问题\n\n"
-            + query + "\n\n"
-            "## 回答要求\n"
-            "- 基于上述文档内容回答，不要添加文档中没有的信息\n"
-            "- 在回答中用 [文件名] 格式标注信息来源\n"
-            "- 如果文档中没有相关信息，请直接说明"
-        )
 
+        # 复用 prompts.py 中集中管理的系统与 QA 模板，避免 Prompt 分散维护
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "你是一个专业的知识库问答助手。基于提供的文档内容回答，不要编造。在回答中用 [文件名] 标注来源。"),
-            ("human", template),
+            ("system", SYSTEM_PROMPT),
+            ("human", QA_PROMPT_TEMPLATE),
         ])
 
-        messages = prompt.format_messages()
+        messages = prompt.format_messages(context=context, question=query)
         response = self.llm.invoke(messages)
 
         print("[LangGraph] Answer generated (" + str(len(response.content)) + " chars)")
@@ -398,6 +388,12 @@ class RAGWorkflow:
 
         return graph.compile()
 
+    def _get_compiled_graph(self):
+        """惰性编译并缓存状态图，后续调用直接复用（避免重复编译开销）"""
+        if self._compiled_graph is None:
+            self._compiled_graph = self.build_graph()
+        return self._compiled_graph
+
     def run(
         self,
         query: str,
@@ -417,7 +413,7 @@ class RAGWorkflow:
         Returns:
             dict: 包含 answer、docs、strategy_used 等信息
         """
-        app = self.build_graph()
+        app = self._get_compiled_graph()
 
         initial_state: RAGState = {
             "original_query": query,

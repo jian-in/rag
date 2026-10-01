@@ -19,6 +19,8 @@ RAG/
 *.key
 *.p12
 *.pfx
+*.keystore
+*.jks
 credentials*.json
 service-account*.json
 
@@ -28,6 +30,17 @@ chroma_db*/
 .secondbrain_manifest.json
 *.sqlite
 *.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Derived private knowledge and personal evaluation data
+/contexts*.json
+/eval_golden.jsonl
 
 # Runtime output
 *.log
@@ -37,6 +50,17 @@ chroma_db*/
 # IDE
 .vscode/
 .idea/
+.qoder/
+.agents/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Machine-local orchestration (personal paths / other local projects)
+/start_all.bat
+/stop_all.bat
 
 # OS
 .DS_Store

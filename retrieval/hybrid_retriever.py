@@ -40,14 +40,24 @@ class BM25Retriever:
         for idx in top_indices:
             if scores[idx] > 0:
                 doc = self._documents[idx]
-                doc.metadata["bm25_score"] = float(scores[idx])
-                results.append(doc)
+                # 返回带分数的副本，避免污染常驻内存的 self._documents（防止旧分数跨查询残留）
+                results.append(
+                    Document(
+                        page_content=doc.page_content,
+                        metadata={**doc.metadata, "bm25_score": float(scores[idx])},
+                    )
+                )
         return results
 
     def _document_text(self, doc: Document) -> str:
         file_name = doc.metadata.get("file_name", "")
         title = Path(file_name).stem if file_name else ""
-        return "\n".join(part for part in [title, file_name, doc.page_content] if part)
+        # Contextual Retrieval: chunks contextualized by contextualize.py carry a
+        # context_prefix in metadata; fold it into BM25 text (contextual BM25).
+        context_prefix = doc.metadata.get("context_prefix", "")
+        return "\n".join(
+            part for part in [title, file_name, context_prefix, doc.page_content] if part
+        )
 
     def _tokenize(self, text: str) -> List[str]:
         import jieba
@@ -88,9 +98,12 @@ class HybridRetriever:
         self,
         query: str,
         top_k: int = config.RETRIEVAL_TOP_K,
-        strategy: str = "rrf",
+        strategy: str = None,
         use_reranker: bool = config.ENABLE_RERANKER,
     ) -> List[Document]:
+        # 缺省使用配置中的融合策略（rrf / weighted）
+        if strategy is None:
+            strategy = config.HYBRID_FUSION_STRATEGY
         fetch_k = max(top_k * 4, top_k)
         bm25_results = self.bm25.search(query, top_k=fetch_k)
         vector_results = self.vector.retrieve(
@@ -136,8 +149,13 @@ class HybridRetriever:
         results = []
         for doc_id in sorted_ids[:top_k]:
             doc = doc_map[doc_id]
-            doc.metadata["rrf_score"] = rrf_scores[doc_id]
-            results.append(doc)
+            # 构造副本写入融合分数，不改动原始文档对象
+            results.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata={**doc.metadata, "rrf_score": rrf_scores[doc_id]},
+                )
+            )
 
         print(f"Hybrid(RRF): vector {len(vector_results)} + bm25 {len(bm25_results)} -> fused {len(results)}")
         return results
@@ -171,8 +189,13 @@ class HybridRetriever:
         results = []
         for doc_id in sorted_ids[:top_k]:
             doc = doc_map[doc_id]
-            doc.metadata["hybrid_score"] = scores[doc_id]
-            results.append(doc)
+            # 构造副本写入融合分数，不改动原始文档对象
+            results.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata={**doc.metadata, "hybrid_score": scores[doc_id]},
+                )
+            )
         return results
 
     def _doc_id(self, doc: Document) -> str:

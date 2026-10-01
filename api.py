@@ -20,6 +20,7 @@ REST API 模块
 
 import os
 import sys
+import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -64,16 +65,79 @@ class BuildResponse(BaseModel):
     doc_count: int = 0
 
 
+class RetrieveRequest(BaseModel):
+    """纯检索请求（不过 LLM，返回完整 chunk）"""
+    query: str
+    top_k: int = 5
+    use_hybrid: bool = True
+
+
+class RetrieveResult(BaseModel):
+    """单个检索结果"""
+    file_name: str
+    content: str
+    source: str = ""
+    chunk_index: int = 0
+    score: float = 0.0
+
+
+class RetrieveResponse(BaseModel):
+    """检索响应"""
+    query: str
+    results: List[RetrieveResult] = []
+    total: int = 0
+
+
+class AddDocumentItem(BaseModel):
+    """待写入的单个文档"""
+    doc_id: str
+    name: str = ""
+    text: str
+
+
+class AddDocumentsRequest(BaseModel):
+    """批量写入外部资料（如课策上传的课程文档）"""
+    course_id: str
+    documents: List[AddDocumentItem] = []
+    origin: str = "kece"
+    replace: bool = True  # True 时先删除该 course_id 旧内容再写入（镜像同步）
+
+
+class AddDocumentsResponse(BaseModel):
+    """写入响应"""
+    success: bool
+    added_chunks: int = 0
+    deleted: int = 0
+    doc_count: int = 0
+    message: str = ""
+
+
+class DeleteDocumentsRequest(BaseModel):
+    """按课程/文档删除"""
+    course_id: Optional[str] = None
+    doc_id: Optional[str] = None
+
+
+class DeleteDocumentsResponse(BaseModel):
+    """删除响应"""
+    success: bool
+    deleted: int = 0
+    doc_count: int = 0
+    message: str = ""
+
+
 # ============================================================
 # FastAPI 应用
 # ============================================================
 
-def create_api(app_state) -> FastAPI:
+def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> FastAPI:
     """
     创建 API 路由
 
     Args:
         app_state: 应用全局状态（和 main.py 共享）
+        add_documents_fn: 写入文档的回调（由 main.py 传入 kb_add_documents，避免重复导入 main）
+        delete_documents_fn: 删除文档的回调（由 main.py 传入 kb_delete_documents）
 
     Returns:
         FastAPI: API 应用实例
@@ -161,6 +225,7 @@ def create_api(app_state) -> FastAPI:
             )
 
         except Exception as e:
+            traceback.print_exc()
             return AskResponse(
                 answer=f"回答失败: {str(e)}",
                 sources=[],
@@ -244,6 +309,7 @@ def create_api(app_state) -> FastAPI:
             )
 
         except Exception as e:
+            traceback.print_exc()
             return BuildResponse(
                 success=False,
                 message=f"构建失败: {str(e)}",
@@ -270,6 +336,116 @@ def create_api(app_state) -> FastAPI:
 
             return {"success": True, "message": "知识库已清空"}
         except Exception as e:
+            traceback.print_exc()
             return {"success": False, "message": f"清空失败: {str(e)}"}
+
+    @api.post("/api/retrieve", response_model=RetrieveResponse)
+    async def retrieve_chunks(request: RetrieveRequest):
+        """
+        纯检索：返回完整 chunk 内容（不过 LLM）
+
+        示例：
+            POST /api/retrieve
+            {"query": "进程调度算法", "top_k": 5, "use_hybrid": true}
+        """
+        if not app_state.is_ready():
+            return RetrieveResponse(query=request.query, results=[], total=0)
+
+        try:
+            if request.use_hybrid and app_state.hybrid_retriever:
+                docs = app_state.hybrid_retriever.search(
+                    request.query, top_k=request.top_k
+                )
+            elif app_state.qa_chain and app_state.qa_chain.retriever:
+                docs = app_state.qa_chain.retriever.retrieve(
+                    request.query, top_k=request.top_k
+                )
+            else:
+                return RetrieveResponse(query=request.query, results=[], total=0)
+
+            results = []
+            for doc in docs:
+                # 混合检索写入的是 rrf_score/hybrid_score，红排写的是 score，依次回退
+                md = doc.metadata
+                score = md.get("score", md.get("rrf_score", md.get("hybrid_score", 0.0)))
+                results.append(RetrieveResult(
+                    file_name=doc.metadata.get("file_name", "未知"),
+                    content=doc.page_content,
+                    source=doc.metadata.get("source", ""),
+                    chunk_index=doc.metadata.get("chunk_index", 0),
+                    score=float(score or 0.0),
+                ))
+
+            return RetrieveResponse(
+                query=request.query,
+                results=results,
+                total=len(results),
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return RetrieveResponse(query=request.query, results=[], total=0)
+
+    @api.post("/api/documents/add", response_model=AddDocumentsResponse)
+    async def add_documents(request: AddDocumentsRequest):
+        """
+        将外部资料（如课策上传的课程文档）写入知识库作为补充。
+
+        replace=True（默认）时先删除该 course_id 的旧内容再写入，实现“课程文档 ↔ 知识库”镜像同步。
+
+        示例：
+            POST /api/documents/add
+            {"course_id": "c1", "documents": [{"doc_id": "d1", "name": "第1章.md", "text": "..."}]}
+        """
+        if add_documents_fn is None or delete_documents_fn is None:
+            return AddDocumentsResponse(success=False, message="服务未配置文档写入回调")
+        if not app_state.is_ready():
+            return AddDocumentsResponse(success=False, message="知识库尚未就绪，请先构建或加载")
+
+        try:
+            deleted = 0
+            if request.replace:
+                del_result = delete_documents_fn(course_id=request.course_id)
+                deleted = del_result.get("deleted", 0)
+
+            items = [it.model_dump() for it in request.documents]
+            add_result = add_documents_fn(items, request.course_id, origin=request.origin)
+            return AddDocumentsResponse(
+                success=True,
+                added_chunks=add_result.get("added_chunks", 0),
+                deleted=deleted,
+                doc_count=add_result.get("doc_count", 0),
+                message="写入成功",
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return AddDocumentsResponse(success=False, message=f"写入失败: {str(e)}")
+
+    @api.post("/api/documents/delete", response_model=DeleteDocumentsResponse)
+    async def delete_documents(request: DeleteDocumentsRequest):
+        """
+        按课程（course_id）或单个文档（doc_id）从知识库删除。
+
+        示例：
+            POST /api/documents/delete
+            {"course_id": "c1"}
+        """
+        if delete_documents_fn is None:
+            return DeleteDocumentsResponse(success=False, message="服务未配置文档删除回调")
+        if not app_state.is_ready():
+            return DeleteDocumentsResponse(success=False, message="知识库尚未就绪")
+        if not request.course_id and not request.doc_id:
+            return DeleteDocumentsResponse(success=False, message="需要提供 course_id 或 doc_id")
+
+        try:
+            result = delete_documents_fn(course_id=request.course_id, doc_id=request.doc_id)
+            return DeleteDocumentsResponse(
+                success=True,
+                deleted=result.get("deleted", 0),
+                doc_count=result.get("doc_count", 0),
+                message="删除成功",
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return DeleteDocumentsResponse(success=False, message=f"删除失败: {str(e)}")
 
     return api
