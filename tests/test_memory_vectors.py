@@ -92,6 +92,68 @@ class EmbeddingReuseTests(unittest.TestCase):
             self.assertEqual((cached, vectors), (1, 1))
 
 
+class CacheBackfillTests(unittest.TestCase):
+    """Vectors embedded before the cache existed must still be reused."""
+
+    def _cache_rows(self, root: Path) -> int:
+        with closing(sqlite3.connect(root / "indexes" / "vault.sqlite3")) as connection:
+            return connection.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0]
+
+    def _forget_cache(self, root: Path) -> None:
+        # Simulate an index written by the previous version (no cached rows).
+        with closing(sqlite3.connect(root / "indexes" / "vault.sqlite3")) as connection:
+            connection.execute("DELETE FROM embedding_cache")
+            connection.commit()
+
+    def test_first_edit_after_upgrade_reuses_pre_existing_vectors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            provider = RecordingEmbeddingProvider()
+            hub = _hub(root, provider)
+            note = root / "vault" / "02-Areas" / "笔记.md"
+            note.write_text(SECTION_A + "\n\n" + SECTION_B, encoding="utf-8")
+            hub.sync(scopes=("vault",))
+            self._forget_cache(root)
+
+            provider.texts.clear()
+            note.write_text(SECTION_NEW + "\n\n" + SECTION_A + "\n\n" + SECTION_B, encoding="utf-8")
+            hub.sync(scopes=("vault",))
+
+            self.assertEqual(len(provider.texts), 1)
+            self.assertIn("新加的段落", provider.texts[0])
+
+    def test_pipeline_rebuild_reuses_vectors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            provider = RecordingEmbeddingProvider()
+            hub = _hub(root, provider)
+            note = root / "vault" / "02-Areas" / "笔记.md"
+            note.write_text(SECTION_A + "\n\n" + SECTION_B, encoding="utf-8")
+            hub.sync(scopes=("vault",))
+            self._forget_cache(root)
+
+            provider.texts.clear()
+            with mock.patch.object(core, "INDEX_PIPELINE_VERSION", "memory-hub-test-bump"):
+                report = hub.sync(scopes=("vault",))
+
+            self.assertEqual(provider.texts, [])
+            self.assertEqual(report["scopes"]["vault"]["vectors_added"], 2)
+
+    def test_deleted_note_is_pruned_even_without_a_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hub = _hub(root, RecordingEmbeddingProvider())
+            note = root / "vault" / "02-Areas" / "笔记.md"
+            note.write_text(SECTION_A + "\n\n" + SECTION_B, encoding="utf-8")
+            hub.sync(scopes=("vault",))
+
+            hub.embedding_provider = None  # e.g. MEMORY_VECTOR_ENABLED turned off later
+            note.unlink()
+            hub.sync(scopes=("vault",))
+
+            self.assertEqual(self._cache_rows(root), 0)
+
+
 class VectorIndexTests(unittest.TestCase):
     def _rows(self):
         vectors = {"a": [1.0, 0.0, 0.0], "b": [0.6, 0.8, 0.0], "c": [0.0, 0.0, 1.0], "d": [-1.0, 0.0, 0.0]}

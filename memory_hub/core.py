@@ -431,6 +431,8 @@ class MemoryHub:
                 "SELECT value FROM metadata WHERE key = 'pipeline_version'"
             ).fetchone()
             if pipeline_row is None or pipeline_row[0] != INDEX_PIPELINE_VERSION:
+                # Re-chunking keeps most text identical; keep its vectors reusable.
+                self._cache_vectors(connection)
                 connection.executescript(
                     """
                     DELETE FROM chunks_fts;
@@ -460,6 +462,7 @@ class MemoryHub:
                     added += 1
                 self._index_source(connection, document, source_hash)
 
+            self._prune_embedding_cache(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_sync', ?)",
                 (datetime.now(timezone.utc).isoformat(),),
@@ -633,6 +636,7 @@ class MemoryHub:
             )
 
     def _delete_source(self, connection: sqlite3.Connection, source_key: str) -> None:
+        self._cache_vectors(connection, source_key)
         row_ids = [
             row[0]
             for row in connection.execute(
@@ -650,8 +654,9 @@ class MemoryHub:
         Editing a note deletes and re-creates all of its chunks (and, by
         cascade, their vectors); chunk ids also shift with ordinals. Vectors are
         therefore cached by (model, content hash), so only genuinely new text is
-        sent to the embedding provider. Cache rows whose text no longer exists
-        in any chunk are pruned, so deleted notes do not linger.
+        sent to the embedding provider. The cache is seeded from existing vectors
+        before chunks are deleted (_cache_vectors) and pruned of text that no
+        longer exists at the end of every scope sync (_prune_embedding_cache).
         """
         assert self.embedding_provider is not None
         model_name = self.embedding_provider.model_name
@@ -714,17 +719,51 @@ class MemoryHub:
                 )
                 added += 1
 
-            live = {_content_hash(row[0]) for row in connection.execute("SELECT content FROM chunks")}
-            stale = [
-                (row[0], row[1])
-                for row in connection.execute("SELECT model, content_hash FROM embedding_cache")
-                if row[1] not in live
-            ]
-            connection.executemany(
-                "DELETE FROM embedding_cache WHERE model = ? AND content_hash = ?", stale
-            )
             connection.commit()
         return added
+
+    @staticmethod
+    def _cache_vectors(connection: sqlite3.Connection, source_key: str | None = None) -> None:
+        """Copy existing vectors into the embedding cache before their chunks go away.
+
+        Chunks (and, by cascade, their vectors) are deleted whenever a source
+        changes or the pipeline version is bumped. Seeding the cache first means
+        unchanged text is reused even on the first edit after an upgrade, when
+        the cache has never seen the vectors that were embedded before it existed.
+        """
+        sql = (
+            "SELECT c.content, v.model, v.dimension, v.vector "
+            "FROM vectors v JOIN chunks c ON c.chunk_id = v.chunk_id"
+        )
+        params: tuple = ()
+        if source_key is not None:
+            sql += " WHERE c.source_key = ?"
+            params = (source_key,)
+        connection.executemany(
+            "INSERT OR IGNORE INTO embedding_cache(model, content_hash, dimension, vector) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (model, _content_hash(content), dimension, vector)
+                for content, model, dimension, vector in connection.execute(sql, params)
+            ],
+        )
+
+    @staticmethod
+    def _prune_embedding_cache(connection: sqlite3.Connection) -> None:
+        """Drop cached vectors whose text no longer exists in any chunk.
+
+        Runs on every scope sync, independent of whether an embedding provider
+        is configured, so deleted notes never linger as cached vectors.
+        """
+        live = {_content_hash(row[0]) for row in connection.execute("SELECT content FROM chunks")}
+        stale = [
+            (row[0], row[1])
+            for row in connection.execute("SELECT model, content_hash FROM embedding_cache")
+            if row[1] not in live
+        ]
+        connection.executemany(
+            "DELETE FROM embedding_cache WHERE model = ? AND content_hash = ?", stale
+        )
 
     def _search_scope(self, scope: str, query: str, limit: int) -> list[MemoryHit]:
         if not self._db_path(scope).is_file():
