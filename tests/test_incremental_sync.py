@@ -245,6 +245,63 @@ class IncrementalSyncTests(unittest.TestCase):
             saved = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(saved["pipeline_signature"], old_signature)
 
+    def test_sync_reclaims_untracked_dead_mirror_sources_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            mirror = root / "data"
+            mirror.mkdir()
+            live = mirror / "live.md"
+            live.write_text("still here", encoding="utf-8")
+            outside_dead = root / "elsewhere" / "gone.md"
+            store = FakeVectorStore()
+            from langchain_core.documents import Document
+
+            untracked = {
+                "orphan-abs": str((mirror / "gone.md").resolve()),
+                "orphan-rel": "sub/gone-too.md",
+                "kece": "kece::c1::d1",
+                "upload": "upload::notes.pdf",
+                "outside": str(outside_dead),
+            }
+            for item_id, source in untracked.items():
+                store.add_documents_with_ids(
+                    [Document(page_content=item_id, metadata={"source": source})], [item_id]
+                )
+
+            report = sync_vectorstore(
+                store,
+                [live],
+                DocumentLoader(),
+                TextSplitter(chunk_size=100, chunk_overlap=10),
+                root / "manifest.json",
+                managed_root=mirror,
+            )
+
+            remaining = set(store._collection.rows)
+            self.assertNotIn("orphan-abs", remaining)
+            self.assertNotIn("orphan-rel", remaining)
+            self.assertTrue({"kece", "upload", "outside"} <= remaining)
+            self.assertEqual(report.orphan_files, 2)
+            self.assertEqual(report.added_files, 1)
+
+    def test_orphan_cleanup_needs_a_managed_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = FakeVectorStore()
+            from langchain_core.documents import Document
+
+            store.add_documents_with_ids(
+                [Document(page_content="x", metadata={"source": str(root / "gone.md")})], ["orphan"]
+            )
+            sync_vectorstore(
+                store,
+                [],
+                DocumentLoader(),
+                TextSplitter(chunk_size=100, chunk_overlap=10),
+                root / "manifest.json",
+            )
+            self.assertIn("orphan", store._collection.rows)
+
     def test_mcp_exposes_sync_tool(self) -> None:
         names = {tool["name"] for tool in MCPServer()._tool_definitions()}
         self.assertIn("sync_knowledge_base", names)

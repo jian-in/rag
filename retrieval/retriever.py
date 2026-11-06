@@ -6,7 +6,7 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 import config
-from retrieval.reranker import Reranker
+from retrieval.reranker import Reranker, rerank_or_fallback
 
 
 class SmartRetriever:
@@ -69,7 +69,7 @@ class SmartRetriever:
 
         if use_reranker and self.reranker is not None:
             rerank_limit = min(rerank_top_n or final_top_k, len(docs))
-            return self.reranker.rerank(query, docs, top_n=rerank_limit)
+            return rerank_or_fallback(self.reranker, query, docs, rerank_limit)
 
         return docs[:final_top_k]
 

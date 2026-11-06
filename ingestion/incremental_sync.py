@@ -61,6 +61,7 @@ class VectorReport:
     unchanged_files: int = 0
     added_chunks: int = 0
     removed_chunks: int = 0
+    orphan_files: int = 0
     errors: List[str] = field(default_factory=list)
     doc_count: int = 0
     vector_count: int = 0
@@ -70,6 +71,7 @@ class VectorReport:
             "added_files": self.added_files,
             "changed_files": self.changed_files,
             "removed_files": self.removed_files,
+            "orphan_files": self.orphan_files,
             "unchanged_files": self.unchanged_files,
             "added_chunks": self.added_chunks,
             "removed_chunks": self.removed_chunks,
@@ -300,6 +302,54 @@ def _pipeline_signature(splitter: TextSplitter) -> str:
     )
 
 
+def _mirror_path(source: str, managed_root: Path) -> Optional[Path]:
+    """Resolve a chunk ``source`` to a path inside the mirror, or None if it is not one.
+
+    Non-file sources (``kece::…``, ``upload::…``) and files outside the mirror
+    (documents built by other means) are never sync's to manage.
+    """
+    if "::" in source:
+        return None
+    try:
+        path = Path(source)
+        if not path.is_absolute():
+            path = managed_root / path
+        path = path.resolve()
+        path.relative_to(managed_root)
+    except (OSError, ValueError):
+        return None
+    return path
+
+
+def _remove_dead_mirror_sources(
+    vectorstore: Any,
+    existing: Dict[str, List[Dict[str, Any]]],
+    managed_root: Path,
+    *,
+    handled: set,
+    report: "VectorReport",
+) -> None:
+    """Reclaim vectors whose mirror file is gone but which the manifest never tracked.
+
+    The manifest-driven pass above only deletes sources it has a record of.
+    Chunks that entered Chroma another way (an older full build, a lost or
+    reset manifest) were invisible to it and kept polluting retrieval after
+    their file disappeared — what ``audit_orphans.py`` reports as dead sources.
+    """
+    for source, chunks in existing.items():
+        if source in handled or not chunks:
+            continue
+        path = _mirror_path(source, managed_root)
+        if path is None or path.exists():
+            continue
+        try:
+            vectorstore.delete_ids([item["id"] for item in chunks])
+            report.orphan_files += 1
+            report.removed_chunks += len(chunks)
+        except Exception as exc:
+            report.errors.append(f"回收孤儿 {source}: {exc}")
+
+
 def sync_vectorstore(
     vectorstore: Any,
     managed_paths: Iterable[Path],
@@ -396,6 +446,15 @@ def sync_vectorstore(
         except Exception as exc:
             report.errors.append(f"删除 {source}: {exc}")
             new_manifest[source] = old_hash
+
+    if managed_root is not None:
+        _remove_dead_mirror_sources(
+            vectorstore,
+            existing,
+            managed_root,
+            handled=set(current) | set(old_manifest),
+            report=report,
+        )
 
     write_failed = False
     for source, (_source_hash, chunks, old_chunks) in pending.items():

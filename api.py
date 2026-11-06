@@ -19,16 +19,20 @@ REST API 模块
 """
 
 import os
+import shutil
 import sys
+import tempfile
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, Request, UploadFile
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 from typing import List, Optional
 
 import config
+import http_guard
 
 
 # ============================================================
@@ -63,6 +67,11 @@ class BuildResponse(BaseModel):
     success: bool
     message: str
     doc_count: int = 0
+
+
+class ClearRequest(BaseModel):
+    """清空知识库请求：必须显式 confirm"""
+    confirm: bool = False
 
 
 class RetrieveRequest(BaseModel):
@@ -130,7 +139,19 @@ class DeleteDocumentsResponse(BaseModel):
 # FastAPI 应用
 # ============================================================
 
-def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> FastAPI:
+BUILD_CLIENT_HEADER = "X-RAG-Client"
+
+
+def create_api(
+    app_state,
+    add_documents_fn=None,
+    delete_documents_fn=None,
+    build_documents_fn=None,
+    clear_fn=None,
+    *,
+    allowed_hosts: Optional[str] = None,
+    api_token: Optional[str] = None,
+) -> FastAPI:
     """
     创建 API 路由
 
@@ -138,6 +159,10 @@ def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> Fa
         app_state: 应用全局状态（和 main.py 共享）
         add_documents_fn: 写入文档的回调（由 main.py 传入 kb_add_documents，避免重复导入 main）
         delete_documents_fn: 删除文档的回调（由 main.py 传入 kb_delete_documents）
+        build_documents_fn: 上传文件入库的回调，参数为 [(临时路径, 原始文件名)]
+        clear_fn: 清空知识库的回调
+        allowed_hosts: 额外信任的 Host（逗号分隔），默认读 config.RAG_ALLOWED_HOSTS
+        api_token: /api/* 的 Bearer 令牌，默认读 config.RAG_API_TOKEN；空则不校验
 
     Returns:
         FastAPI: API 应用实例
@@ -147,6 +172,27 @@ def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> Fa
         description="基于 LangChain + ChromaDB 的智能知识库问答 API",
         version="1.0.0",
     )
+    trusted = http_guard.trusted_hostnames(
+        http_guard.parse_hostnames(
+            config.RAG_ALLOWED_HOSTS if allowed_hosts is None else allowed_hosts
+        )
+    )
+    token = config.RAG_API_TOKEN if api_token is None else api_token
+
+    @api.middleware("http")
+    async def guard_local_requests(request: Request, call_next):
+        # Host 校验覆盖整个站点（含挂载的 Gradio UI），防 DNS Rebinding。
+        rejection = http_guard.forbidden_host_response(request, trusted)
+        if rejection is None and request.url.path.startswith("/api/"):
+            rejection = http_guard.bearer_token_response(request, token)
+            if rejection is None:
+                if request.url.path == "/api/build":
+                    rejection = http_guard.custom_header_required_response(
+                        request, BUILD_CLIENT_HEADER
+                    )
+                else:
+                    rejection = http_guard.json_required_response(request)
+        return rejection or await call_next(request)
 
     @api.get("/api/status", response_model=StatusResponse)
     async def get_status():
@@ -164,7 +210,7 @@ def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> Fa
         )
 
     @api.post("/api/ask", response_model=AskResponse)
-    async def ask_question(request: AskRequest):
+    def ask_question(request: AskRequest):
         """
         向知识库提问
 
@@ -234,113 +280,71 @@ def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> Fa
     @api.post("/api/build", response_model=BuildResponse)
     async def build_knowledge_base(files: List[UploadFile] = File(...)):
         """
-        上传文件并构建知识库
+        上传文件并写入知识库（追加；同名文件会替换旧版本）
+
+        multipart 上传无法要求 JSON，因此必须带自定义请求头 X-RAG-Client
+        （任意非空值）：浏览器跨站发送自定义头会触发 CORS 预检而被拦下。
 
         示例（curl）：
-            curl -X POST http://localhost:7860/api/build \
+            curl -X POST http://127.0.0.1:7860/api/build \
+                -H "X-RAG-Client: curl" \
                 -F "files=@document.pdf"
         """
-        import tempfile
-        from ingestion.loader import DocumentLoader
-        from ingestion.splitter import TextSplitter
-        from vectorstore.store import VectorStoreManager
-        from retrieval.retriever import SmartRetriever
-        from retrieval.hybrid_retriever import BM25Retriever, HybridRetriever
-        from retrieval.conversation_memory import ConversationMemory
-        from retrieval.query_rewriter import QueryRewriter
-        from chain.qa_chain import QAChain
-        from chain.langgraph_workflow import RAGWorkflow
+        if build_documents_fn is None:
+            return BuildResponse(success=False, message="服务未配置文档构建回调")
 
+        temp_dir = tempfile.mkdtemp(prefix="rag-upload-")
         try:
-            loader = DocumentLoader()
-            splitter = TextSplitter()
+            uploads = []
+            for index, upload_file in enumerate(files):
+                display_name = os.path.basename(upload_file.filename or "") or f"upload-{index}"
+                suffix = os.path.splitext(display_name)[1]
+                # 临时文件名只用于落盘，引用来源显示原始文件名
+                tmp_path = os.path.join(temp_dir, f"{index}{suffix}")
+                with open(tmp_path, "wb") as handle:
+                    handle.write(await upload_file.read())
+                uploads.append((tmp_path, display_name))
 
-            all_docs = []
-            for upload_file in files:
-                suffix = os.path.splitext(upload_file.filename)[1]
-                with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=suffix
-                ) as tmp:
-                    content = await upload_file.read()
-                    tmp.write(content)
-                    tmp_path = tmp.name
-
-                docs = loader.load_file(tmp_path)
-                all_docs.extend(docs)
-                os.unlink(tmp_path)
-
-            if not all_docs:
+            result = await run_in_threadpool(build_documents_fn, uploads)
+            if not result.get("added_chunks"):
                 return BuildResponse(
                     success=False,
                     message="上传的文件中没有提取到有效内容",
+                    doc_count=result.get("doc_count", 0),
                 )
-
-            chunks = splitter.split_documents(all_docs)
-
-            app_state.vectorstore_manager = VectorStoreManager()
-            app_state.vectorstore_manager.create_from_documents(chunks)
-            vectorstore = app_state.vectorstore_manager.get_vectorstore()
-
-            retriever = SmartRetriever(vectorstore=vectorstore)
-            app_state.qa_chain = QAChain(retriever=retriever)
-
-            app_state.bm25_retriever = BM25Retriever()
-            app_state.bm25_retriever.build_index(chunks)
-            app_state.hybrid_retriever = HybridRetriever(
-                bm25_retriever=app_state.bm25_retriever,
-                vector_retriever=retriever,
-            )
-
-            app_state.memory = ConversationMemory()
-            app_state.workflow = RAGWorkflow(
-                retriever=retriever,
-                hybrid_retriever=app_state.hybrid_retriever,
-                query_rewriter=QueryRewriter(),
-                memory=app_state.memory,
-            )
-
-            app_state.doc_count = len(chunks)
-            app_state.status = "已就绪"
-
             return BuildResponse(
                 success=True,
-                message=f"知识库构建成功，共 {len(chunks)} 个文本块",
-                doc_count=len(chunks),
+                message=f"已写入 {result['added_chunks']} 个文本块",
+                doc_count=result.get("doc_count", 0),
             )
-
         except Exception as e:
             traceback.print_exc()
-            return BuildResponse(
-                success=False,
-                message=f"构建失败: {str(e)}",
-            )
+            return BuildResponse(success=False, message=f"构建失败: {str(e)}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     @api.post("/api/clear")
-    async def clear_knowledge_base():
-        """清空知识库"""
-        import shutil
+    async def clear_knowledge_base(request: ClearRequest):
+        """
+        清空知识库（需显式确认）
 
+        示例：
+            POST /api/clear
+            {"confirm": true}
+        """
+        if not request.confirm:
+            return {"success": False, "message": '需要 {"confirm": true} 确认清空'}
+        if clear_fn is None:
+            return {"success": False, "message": "服务未配置清空回调"}
         try:
-            chroma_dir = config.CHROMA_PERSIST_DIR
-            if os.path.exists(chroma_dir):
-                shutil.rmtree(chroma_dir)
-
-            app_state.vectorstore_manager = None
-            app_state.qa_chain = None
-            app_state.bm25_retriever = None
-            app_state.hybrid_retriever = None
-            app_state.memory = None
-            app_state.workflow = None
-            app_state.doc_count = 0
-            app_state.status = "未初始化"
-
-            return {"success": True, "message": "知识库已清空"}
+            message = await run_in_threadpool(clear_fn)
+            return {"success": True, "message": message}
         except Exception as e:
             traceback.print_exc()
             return {"success": False, "message": f"清空失败: {str(e)}"}
 
     @api.post("/api/retrieve", response_model=RetrieveResponse)
-    async def retrieve_chunks(request: RetrieveRequest):
+    def retrieve_chunks(request: RetrieveRequest):
         """
         纯检索：返回完整 chunk 内容（不过 LLM）
 
@@ -386,7 +390,7 @@ def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> Fa
             return RetrieveResponse(query=request.query, results=[], total=0)
 
     @api.post("/api/documents/add", response_model=AddDocumentsResponse)
-    async def add_documents(request: AddDocumentsRequest):
+    def add_documents(request: AddDocumentsRequest):
         """
         将外部资料（如课策上传的课程文档）写入知识库作为补充。
 
@@ -421,7 +425,7 @@ def create_api(app_state, add_documents_fn=None, delete_documents_fn=None) -> Fa
             return AddDocumentsResponse(success=False, message=f"写入失败: {str(e)}")
 
     @api.post("/api/documents/delete", response_model=DeleteDocumentsResponse)
-    async def delete_documents(request: DeleteDocumentsRequest):
+    def delete_documents(request: DeleteDocumentsRequest):
         """
         按课程（course_id）或单个文档（doc_id）从知识库删除。
 

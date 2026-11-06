@@ -10,7 +10,9 @@ Two failure classes this tool catches:
   [1] 死源 (dead source)
       A `source` in Chroma whose mirror file no longer exists under `data/`.
       The vectors are stale and keep polluting retrieval.
-      Fix: `--purge` reclaims them.
+      Fix: `sync_knowledge_base` now reclaims dead sources under `data/`
+      automatically (see `_remove_dead_mirror_sources`); `--purge` remains for
+      dead sources outside the mirror or when the MCP server is not running.
 
   [2] 账外 (off-ledger)
       A `source` in Chroma that is NOT registered in the vector ledger.

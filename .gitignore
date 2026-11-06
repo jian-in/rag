@@ -58,6 +58,10 @@ chroma_db*/
 .coverage
 htmlcov/
 
+# Local agent tooling state (databases, scratch notes)
+.rivet/
+.rivet.md
+
 # Machine-local orchestration (personal paths / other local projects)
 /start_all.bat
 /stop_all.bat

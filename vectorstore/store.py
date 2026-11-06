@@ -104,6 +104,15 @@ class VectorStoreManager:
         print(f"✅ 已加载向量数据库，包含 {count} 个向量")
         return self.vectorstore
 
+    def open(self) -> Chroma:
+        """加载已有知识库；目录或集合不存在时创建空集合（用于追加写入）。"""
+        self.vectorstore = Chroma(
+            persist_directory=self.persist_dir,
+            embedding_function=self.embedding_model,
+            collection_name=self.collection_name,
+        )
+        return self.vectorstore
+
     def add_documents(self, documents: List[Document]) -> None:
         """
         增量添加文档到已有知识库
@@ -130,9 +139,10 @@ class VectorStoreManager:
 
         # 获取所有 ID 并删除
         collection = self.vectorstore._collection
-        all_ids = collection.get()["ids"]
-        if all_ids:
-            collection.delete(ids=all_ids)
+        all_ids = collection.get(include=[])["ids"]
+        # 分批删除：Chroma 单次请求有最大批量限制
+        for start in range(0, len(all_ids), 5000):
+            collection.delete(ids=all_ids[start : start + 5000])
         print(f"✅ 已清空向量数据库（删除了 {len(all_ids)} 个向量）")
 
     def delete_by_metadata(self, where: dict) -> int:
@@ -194,8 +204,8 @@ class VectorStoreManager:
         """Delete specific vector IDs without exposing Chroma to callers."""
         if self.vectorstore is None:
             raise RuntimeError("向量数据库未初始化")
-        if ids:
-            self.vectorstore._collection.delete(ids=ids)
+        for start in range(0, len(ids or []), 5000):
+            self.vectorstore._collection.delete(ids=ids[start : start + 5000])
 
     def count(self) -> int:
         """Return the current vector count."""

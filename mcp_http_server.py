@@ -7,13 +7,15 @@ import json
 import os
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncIterator, Dict, Optional
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 import uvicorn
 
+import http_guard
+import mcp_protocol
 from mcp_server import PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, MCPServer, log
 
 SSE_HEARTBEAT_SECONDS = 15
@@ -51,16 +53,22 @@ class HTTPMCPServer:
     def __init__(self) -> None:
         self.engine = MCPServer()
         self.sessions: Dict[str, asyncio.Queue[Optional[str]]] = {}
+        # Tool calls (sync, ask, rewrite…) block on embeddings/LLM calls for
+        # seconds to minutes. Running them on the event loop froze /health,
+        # SSE keep-alives and every other client. A single worker keeps the
+        # previous one-at-a-time semantics: KnowledgeRuntime is not thread-safe
+        # (sync rebuilds the retrievers that search reads).
+        self._tool_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-mcp-tool")
 
-    def _result(self, message_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": message_id, "result": result}
+    async def handle_message_async(self, message: Any) -> Optional[Dict[str, Any]]:
+        """Handle a message without blocking the event loop on tool calls."""
+        if isinstance(message, dict) and message.get("method") == "tools/call":
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._tool_executor, self.handle_message, message)
+        return self.handle_message(message)
 
     def _error(self, message_id: Any, code: int, message: str) -> Dict[str, Any]:
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "error": {"code": code, "message": message},
-        }
+        return mcp_protocol.error_message(message_id, code, message)
 
     def _format_sse(
         self,
@@ -82,52 +90,8 @@ class HTTPMCPServer:
                 lines.append(f"data: {line}")
         return "\n".join(lines) + "\n\n"
 
-    def handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        method = message.get("method")
-        message_id = message.get("id")
-        params = message.get("params", {}) or {}
-
-        if method == "initialize":
-            self.engine.initialized = True
-            return self._result(
-                message_id,
-                {
-                    "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                },
-            )
-
-        if method == "notifications/initialized":
-            return None
-
-        if method == "ping":
-            return self._result(message_id, {})
-
-        if method == "tools/list":
-            return self._result(message_id, {"tools": self.engine._tool_definitions()})
-
-        if method == "tools/call":
-            try:
-                tool_name = params.get("name", "")
-                arguments = params.get("arguments", {}) or {}
-                result = self.engine._dispatch_tool(tool_name, arguments)
-                return self._result(message_id, result)
-            except Exception as exc:
-                return self._result(
-                    message_id,
-                    {
-                        "content": [{"type": "text", "text": str(exc)}],
-                        "isError": True,
-                    },
-                )
-
-        if method == "resources/list":
-            return self._result(message_id, {"resources": []})
-
-        if message_id is None:
-            return None
-        return self._error(message_id, -32601, f"Method not found: {method}")
+    def handle_message(self, message: Any) -> Optional[Dict[str, Any]]:
+        return self.engine._surface.dispatch(message)
 
     def open_session(self, session_id: str) -> asyncio.Queue[Optional[str]]:
         queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
@@ -182,22 +146,13 @@ class HTTPMCPServer:
 server = HTTPMCPServer()
 app = FastAPI(title="RAG MCP HTTP Server", version=SERVER_VERSION)
 
-# 允许的 Host 头主机名（含任意端口）。
-# 防 DNS Rebinding：攻击者把自己的域名解析到 127.0.0.1，浏览器发出的 Host
-# 仍是攻击者域名，因此校验 Host 而不是 Origin（同源请求不带 Origin）。
-_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
-
-
 @app.middleware("http")
-async def enforce_trusted_host(request: Request, call_next):
-    # Host 形如 "127.0.0.1:8766" 或 "[::1]:8766"，补上 scheme 才能正确解析
-    hostname = (urlsplit("//" + request.headers.get("host", "")).hostname or "").lower()
-    if hostname not in _ALLOWED_HOSTNAMES:
-        return JSONResponse(
-            status_code=403,
-            content={"error": "forbidden: untrusted Host header"},
-        )
-    return await call_next(request)
+async def enforce_local_requests(request: Request, call_next):
+    # Host 校验防 DNS Rebinding；拒绝可免预检的请求体类型防 CSRF（见 http_guard）。
+    rejection = http_guard.forbidden_host_response(
+        request, http_guard.LOOPBACK_HOSTNAMES
+    ) or http_guard.preflight_exempt_body_response(request)
+    return rejection or await call_next(request)
 
 
 @app.get("/health")
@@ -214,7 +169,7 @@ async def health() -> Dict[str, Any]:
 async def mcp_post(request: Request):
     try:
         message = await request.json()
-        response = server.handle_message(message)
+        response = await server.handle_message_async(message)
         if response is None:
             return JSONResponse(status_code=202, content={})
         return JSONResponse(content=response)
@@ -250,7 +205,7 @@ async def sse_messages(
 ):
     try:
         message = await request.json()
-        response = server.handle_message(message)
+        response = await server.handle_message_async(message)
         if response is not None:
             await server.enqueue_response(session_id, response)
         return PlainTextResponse("accepted", status_code=202)
@@ -285,7 +240,8 @@ async def sse_messages_alias(
 
 def main() -> int:
     host = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_HTTP_PORT", "8765"))
+    # 与 start_mcp_server.bat 和各客户端配置（http://127.0.0.1:8766/mcp）保持一致
+    port = int(os.getenv("MCP_HTTP_PORT", "8766"))
     log(f"{SERVER_NAME} HTTP MCP server listening on http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
     return 0

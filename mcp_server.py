@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import config
+import mcp_protocol
 from chain.qa_chain import QAChain
 from ingestion.incremental_sync import (
     DEFAULT_INCLUDE_DIRS,
@@ -27,12 +28,12 @@ from ingestion.loader import DocumentLoader
 from ingestion.splitter import TextSplitter
 from langchain_core.documents import Document
 from retrieval.hybrid_retriever import BM25Retriever, HybridRetriever
-from retrieval.reranker import Reranker
+from retrieval.reranker import Reranker, rerank_or_fallback
 from retrieval.retriever import SmartRetriever
 from vectorstore.store import VectorStoreManager
 
 
-PROTOCOL_VERSION = "2024-11-05"
+PROTOCOL_VERSION = mcp_protocol.DEFAULT_PROTOCOL_VERSION
 SERVER_NAME = "rag-knowledge-base"
 SERVER_VERSION = "1.1.0"
 
@@ -59,6 +60,61 @@ def redirect_stdout_to_stderr():
     output = buffer.getvalue()
     if output:
         print(output, file=sys.stderr, end="", flush=True)
+
+
+MAX_TOP_K = 20
+MAX_WINDOW = 3
+REWRITE_STRATEGIES = (None, "expand", "decompose", "hyde")
+
+
+def _required_text(arguments: Dict[str, Any], name: str) -> str:
+    value = arguments.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise MCPError(f"`{name}` is required and must be a non-empty string.")
+    return value.strip()
+
+
+def _bounded_int(arguments: Dict[str, Any], name: str, default: int, low: int, high: int) -> int:
+    """Read an integer argument and clamp it to the advertised schema range.
+
+    The JSON schema is advisory to clients; without clamping, window=500 or
+    top_k=10000 would dump huge contexts and hammer the embedding/rerank APIs.
+    """
+    value = arguments.get(name, default)
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise MCPError(f"`{name}` must be an integer.")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise MCPError(f"`{name}` must be an integer.") from exc
+    return max(low, min(high, number))
+
+
+def _strict_bool(arguments: Dict[str, Any], name: str, default: bool) -> bool:
+    value = arguments.get(name, default)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    # bool("false") is True; accept the common string spellings explicitly.
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise MCPError(f"`{name}` must be a boolean.")
+
+
+def _retrieval_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    rewrite_strategy = arguments.get("rewrite_strategy")
+    if rewrite_strategy not in REWRITE_STRATEGIES:
+        allowed = ", ".join(str(item) for item in REWRITE_STRATEGIES)
+        raise MCPError(f"`rewrite_strategy` must be one of: {allowed}.")
+    return {
+        "top_k": _bounded_int(arguments, "top_k", 5, 1, MAX_TOP_K),
+        "use_hybrid": _strict_bool(arguments, "use_hybrid", True),
+        "rewrite_strategy": rewrite_strategy,
+        "window": _bounded_int(arguments, "window", 0, 0, MAX_WINDOW),
+    }
 
 
 class KnowledgeRuntime:
@@ -364,50 +420,71 @@ class KnowledgeRuntime:
         assert self.hybrid_retriever is not None
         assert self.qa_chain is not None
 
-        if rewrite_strategy:
-            with redirect_stdout_to_stderr():
-                queries = self.qa_chain.rewriter.rewrite(query, strategy=rewrite_strategy)
-            all_docs = []
-            seen = set()
-            for rewritten in queries:
-                batch = self._retrieve_docs(
-                    query=rewritten,
-                    top_k=top_k,
-                    use_hybrid=use_hybrid,
-                    rewrite_strategy=None,
-                )
-                for doc in batch:
-                    key = self._doc_key(doc)
-                    if key not in seen:
-                        seen.add(key)
-                        all_docs.append(doc)
-            # Global re-rank of the merged candidate pool with the ORIGINAL query.
-            # Without this, naive concatenation + truncation keeps mostly the first
-            # rewritten query's hits and silently drops better candidates from the rest.
-            reranker = getattr(self.vector_retriever, "reranker", None)
-            if reranker is not None and len(all_docs) > top_k:
-                with redirect_stdout_to_stderr():
-                    return reranker.rerank(query, all_docs, top_n=top_k)
-            return all_docs[:top_k]
+        if not rewrite_strategy:
+            return self._recall(query, top_k, use_hybrid, use_reranker=config.ENABLE_RERANKER)
 
         with redirect_stdout_to_stderr():
+            rewritten = self.qa_chain.rewriter.rewrite(query, strategy=rewrite_strategy)
+        # The original question joins the pool: expand/hyde replace it entirely,
+        # which loses exact keyword matches the user actually typed.
+        queries = list(dict.fromkeys([query, *(item for item in rewritten if item)]))
+        # Recall per query without reranking, fuse by rank (RRF), then rerank the
+        # fused pool once against the ORIGINAL question. Concatenate-and-truncate
+        # kept almost only the first query's hits when no reranker was enabled.
+        ranked_lists = [
+            self._recall(item, top_k, use_hybrid, use_reranker=False) for item in queries
+        ]
+        fused = self._rrf_merge(ranked_lists, limit=max(top_k * 3, top_k))
+        reranker = getattr(self.vector_retriever, "reranker", None)
+        if config.ENABLE_RERANKER and reranker is not None and fused:
+            with redirect_stdout_to_stderr():
+                return rerank_or_fallback(reranker, query, fused, min(top_k, len(fused)))
+        return fused[:top_k]
+
+    def _recall(
+        self,
+        query: str,
+        top_k: int,
+        use_hybrid: bool,
+        *,
+        use_reranker: bool,
+    ) -> List[Any]:
+        assert self.vector_retriever is not None
+        assert self.hybrid_retriever is not None
+        with redirect_stdout_to_stderr():
             if use_hybrid:
-                docs = self.hybrid_retriever.search(
+                return self.hybrid_retriever.search(
                     query,
                     top_k=top_k,
                     strategy="rrf",
-                    use_reranker=config.ENABLE_RERANKER,
+                    use_reranker=use_reranker,
                 )
-            else:
-                docs = self.vector_retriever.retrieve(
-                    query=query,
-                    strategy="mmr",
-                    use_reranker=config.ENABLE_RERANKER,
-                    top_k=top_k,
-                    candidate_k=max(top_k * 4, top_k),
-                    rerank_top_n=top_k,
-                )
-        return docs
+            return self.vector_retriever.retrieve(
+                query=query,
+                strategy="mmr",
+                use_reranker=use_reranker,
+                top_k=top_k,
+                candidate_k=max(top_k * 4, top_k),
+                rerank_top_n=top_k,
+            )
+
+    def _rrf_merge(self, ranked_lists: List[List[Any]], limit: int, k: int = 60) -> List[Any]:
+        """Reciprocal-rank fusion of several ranked lists (scores written to copies)."""
+        scores: Dict[str, float] = {}
+        first_seen: Dict[str, Any] = {}
+        for ranked in ranked_lists:
+            for rank, doc in enumerate(ranked, start=1):
+                key = self._doc_key(doc)
+                scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+                first_seen.setdefault(key, doc)
+        ordered = sorted(scores, key=lambda key: scores[key], reverse=True)[:limit]
+        return [
+            Document(
+                page_content=first_seen[key].page_content,
+                metadata={**first_seen[key].metadata, "rrf_score": scores[key]},
+            )
+            for key in ordered
+        ]
 
     def search(
         self,
@@ -469,6 +546,7 @@ class MCPServer:
         self.runtime = KnowledgeRuntime()
         self.initialized = False
         self._wire_mode = "framed"
+        self._surface = self.surface()
 
     def _tool_definitions(self) -> List[Dict[str, Any]]:
         return [
@@ -665,25 +743,11 @@ class MCPServer:
         sys.stdout.buffer.write(payload)
         sys.stdout.buffer.flush()
 
-    def _result(self, message_id: Any, result: Dict[str, Any]) -> None:
-        self._send({"jsonrpc": "2.0", "id": message_id, "result": result})
-
     def _error(self, message_id: Any, code: int, message: str) -> None:
-        self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "error": {"code": code, "message": message},
-            }
-        )
+        self._send(mcp_protocol.error_message(message_id, code, message))
 
     def _tool_response(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        text = json.dumps(payload, ensure_ascii=False, indent=2)
-        return {
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": payload,
-            "isError": False,
-        }
+        return mcp_protocol.tool_result(payload)
 
     def _dispatch_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         if name == "get_status":
@@ -698,83 +762,35 @@ class MCPServer:
         if name == "sync_knowledge_base":
             return self._tool_response(self.runtime.sync())
         if name == "search_knowledge":
-            query = arguments.get("query")
-            if not query:
-                raise MCPError("`query` is required.")
-            top_k = int(arguments.get("top_k", 5))
+            query = _required_text(arguments, "query")
             return self._tool_response(
-                self.runtime.search(
-                    query=query,
-                    top_k=top_k,
-                    use_hybrid=bool(arguments.get("use_hybrid", True)),
-                    rewrite_strategy=arguments.get("rewrite_strategy"),
-                    window=int(arguments.get("window", 0)),
-                )
+                self.runtime.search(query=query, **_retrieval_arguments(arguments))
             )
         if name == "ask_knowledge":
-            question = arguments.get("question")
-            if not question:
-                raise MCPError("`question` is required.")
-            top_k = int(arguments.get("top_k", 5))
+            question = _required_text(arguments, "question")
             return self._tool_response(
-                self.runtime.ask(
-                    question=question,
-                    top_k=top_k,
-                    use_hybrid=bool(arguments.get("use_hybrid", True)),
-                    rewrite_strategy=arguments.get("rewrite_strategy"),
-                    window=int(arguments.get("window", 0)),
-                )
+                self.runtime.ask(question=question, **_retrieval_arguments(arguments))
             )
         raise MCPError(f"Unknown tool: {name}")
 
-    def handle(self, message: Dict[str, Any]) -> None:
-        method = message.get("method")
-        message_id = message.get("id")
-        params = message.get("params", {})
+    def surface(self) -> mcp_protocol.MCPSurface:
+        """Protocol surface shared by the stdio and HTTP/SSE transports."""
+        return mcp_protocol.MCPSurface(
+            name=SERVER_NAME,
+            version=SERVER_VERSION,
+            # Late-bound so tests and subclasses can replace the methods.
+            list_tools=lambda: self._tool_definitions(),
+            call_tool=lambda name, arguments: self._dispatch_tool(name, arguments),
+            on_initialize=self._mark_initialized,
+        )
 
-        if method == "initialize":
-            self.initialized = True
-            self._result(
-                message_id,
-                {
-                    "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                },
-            )
-            return
+    def _mark_initialized(self) -> None:
+        self.initialized = True
 
-        if method == "notifications/initialized":
-            return
-
-        if method == "ping":
-            self._result(message_id, {})
-            return
-
-        if method == "tools/list":
-            self._result(message_id, {"tools": self._tool_definitions()})
-            return
-
-        if method == "tools/call":
-            try:
-                tool_name = params.get("name", "")
-                arguments = params.get("arguments", {}) or {}
-                result = self._dispatch_tool(tool_name, arguments)
-                self._result(message_id, result)
-            except Exception as exc:  # pragma: no cover - protocol surface
-                error_payload = {
-                    "content": [{"type": "text", "text": str(exc)}],
-                    "isError": True,
-                }
-                self._result(message_id, error_payload)
-            return
-
-        if method == "resources/list":
-            self._result(message_id, {"resources": []})
-            return
-
-        if message_id is not None:
-            self._error(message_id, -32601, f"Method not found: {method}")
+    def handle(self, message: Any) -> None:
+        response = self._surface.dispatch(message)
+        if response is not None:
+            self._send(response)
 
     def serve(self) -> None:
         log(f"{SERVER_NAME} MCP server started from {ROOT}")

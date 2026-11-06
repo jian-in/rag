@@ -66,6 +66,17 @@ python main.py
 
 浏览器打开 `http://localhost:7860` 即可使用。
 
+服务默认只监听本机（`127.0.0.1`），并拒绝非本机 `Host` 的请求（防 DNS Rebinding）。REST 接口的写操作必须是 JSON 请求；`/api/build` 走 multipart 上传，需要额外带 `X-RAG-Client` 请求头；`/api/clear` 必须传 `{"confirm": true}`。确实要开放到局域网时，在 `.env` 里同时设置 `RAG_WEB_HOST`、`RAG_ALLOWED_HOSTS` 和 `RAG_API_TOKEN`，详见 `.env.example`。
+
+### 运行测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q tests
+```
+
+GitHub Actions（`.github/workflows/tests.yml`）会在每次推送和 PR 时，在 Windows 和 Ubuntu 上运行同样的测试。
+
 ### 4. 使用流程
 
 1. 在「知识库构建」页面上传文档（支持 PDF/TXT/MD/DOCX）

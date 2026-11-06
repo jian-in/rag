@@ -106,6 +106,17 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
 EVAL_DATASET_PATH = os.getenv("EVAL_DATASET_PATH", "./data/eval_dataset.json")
 
 # ============================================================
+# Web UI / REST API 服务（main.py）
+# ============================================================
+# 默认只监听本机。知识库是私人资料，开放到局域网前请同时设置
+# RAG_ALLOWED_HOSTS（客户端访问时用的主机名/IP）和 RAG_API_TOKEN。
+RAG_WEB_HOST = os.getenv("RAG_WEB_HOST", "127.0.0.1")
+RAG_WEB_PORT = int(os.getenv("RAG_WEB_PORT", "7860"))
+RAG_ALLOWED_HOSTS = os.getenv("RAG_ALLOWED_HOSTS", "")
+# 设置后 /api/* 需带 Authorization: Bearer <token>
+RAG_API_TOKEN = os.getenv("RAG_API_TOKEN", "")
+
+# ============================================================
 # SecondBrain 增量同步配置
 # ============================================================
 SECONDBRAIN_ROOT = os.getenv("SECONDBRAIN_ROOT", r"C:\Desktop\SecondBrain")

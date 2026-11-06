@@ -8,6 +8,7 @@ from typing import Dict, List
 from langchain_core.documents import Document
 
 import config
+from retrieval.reranker import rerank_or_fallback
 
 
 class BM25Retriever:
@@ -130,7 +131,7 @@ class HybridRetriever:
 
         if use_reranker and self.vector.reranker is not None:
             rerank_limit = min(top_k, len(fused_results))
-            return self.vector.reranker.rerank(query, fused_results, top_n=rerank_limit)
+            return rerank_or_fallback(self.vector.reranker, query, fused_results, rerank_limit)
 
         return fused_results[:top_k]
 

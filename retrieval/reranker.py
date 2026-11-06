@@ -8,6 +8,24 @@ from langchain_core.documents import Document
 import config
 
 
+def rerank_or_fallback(
+    reranker: "Reranker",
+    query: str,
+    documents: List[Document],
+    top_n: int,
+) -> List[Document]:
+    """Rerank, degrading to the incoming (fused/recall) order when the backend fails.
+
+    Reranking is a quality boost, not a requirement: a SiliconFlow/Cohere outage,
+    a timeout or a missing key must not turn every search into an error.
+    """
+    try:
+        return reranker.rerank(query, documents, top_n=top_n)
+    except Exception as exc:
+        print(f"⚠️ 重排序失败，退回召回排序结果: {exc}")
+        return list(documents[:top_n])
+
+
 class Reranker:
     """Support Cohere, local cross-encoder, and SiliconFlow rerank backends."""
 

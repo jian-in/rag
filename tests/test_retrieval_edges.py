@@ -159,5 +159,42 @@ class RerankerPurityTests(unittest.TestCase):
             )
 
 
+class RerankerFallbackTests(unittest.TestCase):
+    """重排序后端故障时检索应降级为召回排序，而不是整体报错。"""
+
+    def _broken_reranker(self):
+        reranker = mock.Mock()
+        reranker.rerank.side_effect = RuntimeError("SiliconFlow rerank request failed: 503")
+        return reranker
+
+    def test_hybrid_search_survives_reranker_outage(self):
+        from retrieval.hybrid_retriever import HybridRetriever
+
+        corpus = _corpus()
+        bm25 = BM25Retriever()
+        bm25.build_index(corpus)
+        vector = mock.Mock()
+        vector.reranker = self._broken_reranker()
+        vector.retrieve.return_value = corpus[1:4]
+
+        results = HybridRetriever(bm25, vector).search(
+            "量子纠缠", top_k=2, strategy="rrf", use_reranker=True
+        )
+
+        self.assertEqual(len(results), 2)
+        vector.reranker.rerank.assert_called_once()
+
+    def test_vector_retrieve_survives_reranker_outage(self):
+        from retrieval.retriever import SmartRetriever
+
+        store = mock.Mock()
+        store.max_marginal_relevance_search.return_value = _corpus()[:5]
+        retriever = SmartRetriever(vectorstore=store, reranker=self._broken_reranker())
+
+        results = retriever.retrieve("q", use_reranker=True, top_k=3, candidate_k=5)
+
+        self.assertEqual([doc.metadata["source"] for doc in results], ["physics.md", "other0.md", "other1.md"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

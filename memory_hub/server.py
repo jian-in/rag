@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+
+import http_guard
+import mcp_protocol
 
 from .core import MEMORY_SCOPES, RETRIEVAL_MODES, MemoryHub
 
@@ -17,22 +19,9 @@ class MemoryMCPError(RuntimeError):
     pass
 
 
-# 允许的 Host 头主机名（含任意端口）。防 DNS Rebinding：攻击者把自己的域名
-# 解析到 127.0.0.1 后，浏览器发出的 Host 仍是攻击者域名。
-TRUSTED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
-# 写操作必须是 JSON：text/plain、表单等 CORS 简单请求不触发预检，
-# 任何网页都能跨站发出；强制 application/json 后浏览器会先预检，而本服务不放行 CORS。
-_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-
-
-def _request_hostname(request: Request) -> str:
-    # Host 形如 "127.0.0.1:8771" 或 "[::1]:8771"，补上 "//" 才能按 netloc 解析
-    return (urlsplit("//" + request.headers.get("host", "")).hostname or "").lower()
-
-
-def _is_json_request(request: Request) -> bool:
-    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    return media_type == "application/json"
+# 只信任本机 Host（防 DNS Rebinding）；写操作强制 application/json（防 CSRF）。
+# 原理见 http_guard 模块说明。
+TRUSTED_HOSTNAMES = http_guard.LOOPBACK_HOSTNAMES
 
 
 class MemoryMCP:
@@ -203,17 +192,10 @@ def create_app(
 
     @app.middleware("http")
     async def enforce_local_json_requests(request: Request, call_next):
-        if _request_hostname(request) not in trusted_hostnames:
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "forbidden: untrusted Host header"},
-            )
-        if request.method in _BODY_METHODS and not _is_json_request(request):
-            return JSONResponse(
-                status_code=415,
-                content={"detail": "Content-Type must be application/json"},
-            )
-        return await call_next(request)
+        rejection = http_guard.forbidden_host_response(
+            request, trusted_hostnames
+        ) or http_guard.json_required_response(request)
+        return rejection or await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -357,82 +339,49 @@ def create_app(
         except (ValueError, RuntimeError) as exc:
             return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    def read_resource(uri: str) -> list[dict[str, Any]] | None:
+        if uri != "memory://entry":
+            return None
+        payload = {
+            "instruction": "Call memory_context with the current task before asking Afei to repeat known information.",
+            "scopes": list(MEMORY_SCOPES),
+            "status": hub.status(),
+        }
+        return [
+            {
+                "uri": "memory://entry",
+                "mimeType": "application/json",
+                "text": json.dumps(payload, ensure_ascii=False, indent=2),
+            }
+        ]
+
+    surface = mcp_protocol.MCPSurface(
+        name="feili-personal-memory",
+        version="0.3.0",
+        list_tools=tools.tool_definitions,
+        call_tool=lambda name, arguments: mcp_protocol.tool_result(
+            tools.call_tool(name, arguments)
+        ),
+        list_resources=lambda: [
+            {
+                "uri": "memory://entry",
+                "name": "Personal memory entry",
+                "description": "Discovery instructions and current index status.",
+                "mimeType": "application/json",
+            }
+        ],
+        read_resource=read_resource,
+    )
+
     @app.post("/mcp")
     async def mcp(request: Request) -> JSONResponse:
         message = await request.json()
-        message_id = message.get("id")
-        method = message.get("method")
-        params = message.get("params", {}) or {}
-
-        if method == "notifications/initialized":
+        # Tool calls and resources/read touch SQLite and possibly remote
+        # providers, so the whole dispatch runs off the event loop.
+        response = await run_in_threadpool(surface.dispatch, message)
+        if response is None:
             return JSONResponse(status_code=202, content={})
-        if method == "initialize":
-            result = {
-                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
-                "capabilities": {"tools": {}, "resources": {}},
-                "serverInfo": {"name": "feili-personal-memory", "version": "0.3.0"},
-            }
-        elif method == "ping":
-            result = {}
-        elif method == "tools/list":
-            result = {"tools": tools.tool_definitions()}
-        elif method == "tools/call":
-            try:
-                payload = await run_in_threadpool(
-                    tools.call_tool,
-                    str(params.get("name", "")),
-                    params.get("arguments", {}) or {},
-                )
-                result = {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(payload, ensure_ascii=False, indent=2),
-                        }
-                    ],
-                    "structuredContent": payload,
-                    "isError": False,
-                }
-            except Exception as exc:
-                result = {
-                    "content": [{"type": "text", "text": str(exc)}],
-                    "isError": True,
-                }
-        elif method == "resources/list":
-            result = {
-                "resources": [
-                    {
-                        "uri": "memory://entry",
-                        "name": "Personal memory entry",
-                        "description": "Discovery instructions and current index status.",
-                        "mimeType": "application/json",
-                    }
-                ]
-            }
-        elif method == "resources/read" and params.get("uri") == "memory://entry":
-            payload = {
-                "instruction": "Call memory_context with the current task before asking Afei to repeat known information.",
-                "scopes": list(MEMORY_SCOPES),
-                "status": await run_in_threadpool(hub.status),
-            }
-            result = {
-                "contents": [
-                    {
-                        "uri": "memory://entry",
-                        "mimeType": "application/json",
-                        "text": json.dumps(payload, ensure_ascii=False, indent=2),
-                    }
-                ]
-            }
-        else:
-            return JSONResponse(
-                content={
-                    "jsonrpc": "2.0",
-                    "id": message_id,
-                    "error": {"code": -32601, "message": f"Method not found: {method}"},
-                }
-            )
-        return JSONResponse(content={"jsonrpc": "2.0", "id": message_id, "result": result})
+        return JSONResponse(content=response)
 
     @app.get("/")
     async def dashboard() -> FileResponse:

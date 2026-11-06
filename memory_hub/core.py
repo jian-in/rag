@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Iterator, Protocol, Sequence
 from urllib.parse import quote
 
+try:  # numpy is optional: it speeds up vector search but the hub runs without it
+    import numpy as _np
+except ImportError:  # pragma: no cover - exercised only without numpy installed
+    _np = None
+
 
 MEMORY_SCOPES = ("vault", "profile", "episodes")
 RETRIEVAL_MODES = ("hybrid", "local")
@@ -67,8 +72,8 @@ def _default_index_root() -> Path:
 class MemoryHubSettings:
     index_root: Path = _default_index_root()
     vault_root: Path = Path(r"C:\Desktop\SecondBrain")
-    memory_root: Path = Path(r"C:\Users\jianbo\.codex\memory")
-    rollout_root: Path = Path(r"C:\Users\jianbo\.codex\memories\rollout_summaries")
+    memory_root: Path = Path.home() / ".codex" / "memory"
+    rollout_root: Path = Path.home() / ".codex" / "memories" / "rollout_summaries"
     vault_include_dirs: tuple[str, ...] = ("01-Projects", "02-Areas", "03-Resources", "Daily")
     chunk_size: int = 900
     chunk_overlap: int = 120
@@ -135,6 +140,8 @@ class MemoryHub:
         self.embedding_provider = embedding_provider
         self.rerank_provider = rerank_provider
         self._last_provider_error: str | None = None
+        # scope -> (version key, _VectorIndex); see _vector_index
+        self._vector_cache: dict[str, tuple[tuple, _VectorIndex]] = {}
         from .review import MemoryReviewQueue
 
         self._review_queue = MemoryReviewQueue(self.settings.index_root.parent / "audit.sqlite3")
@@ -638,6 +645,14 @@ class MemoryHub:
         connection.execute("DELETE FROM sources WHERE source_key = ?", (source_key,))
 
     def _sync_vectors(self, scope: str) -> int:
+        """Attach vectors to chunks that lack one, embedding only unseen text.
+
+        Editing a note deletes and re-creates all of its chunks (and, by
+        cascade, their vectors); chunk ids also shift with ordinals. Vectors are
+        therefore cached by (model, content hash), so only genuinely new text is
+        sent to the embedding provider. Cache rows whose text no longer exists
+        in any chunk are pruned, so deleted notes do not linger.
+        """
         assert self.embedding_provider is not None
         model_name = self.embedding_provider.model_name
         with self._connect(scope) as connection:
@@ -652,20 +667,62 @@ class MemoryHub:
                 (model_name,),
             ).fetchall()
             added = 0
-            for start in range(0, len(rows), 32):
-                batch = rows[start : start + 32]
-                vectors = self.embedding_provider.embed([row[1] for row in batch])
-                if len(vectors) != len(batch):
-                    raise RuntimeError("embedding provider returned an unexpected vector count")
-                for row, vector in zip(batch, vectors):
-                    if not vector:
-                        raise RuntimeError("embedding provider returned an empty vector")
+            missing: dict[str, str] = {}
+            pending: list[tuple[str, str]] = []
+            for chunk_id, content in rows:
+                content_hash = _content_hash(content)
+                cached = connection.execute(
+                    "SELECT dimension, vector FROM embedding_cache "
+                    "WHERE model = ? AND content_hash = ?",
+                    (model_name, content_hash),
+                ).fetchone()
+                if cached is not None:
                     connection.execute(
                         "INSERT OR REPLACE INTO vectors(chunk_id, model, dimension, vector) "
                         "VALUES (?, ?, ?, ?)",
-                        (row[0], model_name, len(vector), _pack_vector(vector)),
+                        (chunk_id, model_name, cached[0], cached[1]),
                     )
                     added += 1
+                    continue
+                missing.setdefault(content_hash, content)
+                pending.append((chunk_id, content_hash))
+
+            embedded: dict[str, bytes] = {}
+            dimensions: dict[str, int] = {}
+            unique = list(missing.items())
+            for start in range(0, len(unique), 32):
+                batch = unique[start : start + 32]
+                vectors = self.embedding_provider.embed([content for _, content in batch])
+                if len(vectors) != len(batch):
+                    raise RuntimeError("embedding provider returned an unexpected vector count")
+                for (content_hash, _), vector in zip(batch, vectors):
+                    if not vector:
+                        raise RuntimeError("embedding provider returned an empty vector")
+                    packed = _pack_vector(vector)
+                    embedded[content_hash] = packed
+                    dimensions[content_hash] = len(vector)
+                    connection.execute(
+                        "INSERT OR REPLACE INTO embedding_cache(model, content_hash, dimension, vector) "
+                        "VALUES (?, ?, ?, ?)",
+                        (model_name, content_hash, len(vector), packed),
+                    )
+            for chunk_id, content_hash in pending:
+                connection.execute(
+                    "INSERT OR REPLACE INTO vectors(chunk_id, model, dimension, vector) "
+                    "VALUES (?, ?, ?, ?)",
+                    (chunk_id, model_name, dimensions[content_hash], embedded[content_hash]),
+                )
+                added += 1
+
+            live = {_content_hash(row[0]) for row in connection.execute("SELECT content FROM chunks")}
+            stale = [
+                (row[0], row[1])
+                for row in connection.execute("SELECT model, content_hash FROM embedding_cache")
+                if row[1] not in live
+            ]
+            connection.executemany(
+                "DELETE FROM embedding_cache WHERE model = ? AND content_hash = ?", stale
+            )
             connection.commit()
         return added
 
@@ -718,29 +775,10 @@ class MemoryHub:
     ) -> list[MemoryHit]:
         if not self._db_path(scope).is_file() or self.embedding_provider is None:
             return []
-        with self._connect(scope) as connection:
-            rows = connection.execute(
-                """
-                SELECT c.chunk_id, s.source_path, s.title, c.heading, c.content,
-                       s.source_key, s.obsidian_uri, v.dimension, v.vector
-                FROM vectors v
-                JOIN chunks c ON c.chunk_id = v.chunk_id
-                JOIN sources s ON s.source_key = c.source_key
-                WHERE v.model = ?
-                """,
-                (self.embedding_provider.model_name,),
-            ).fetchall()
-
-        scored: list[tuple[float, sqlite3.Row | tuple]] = []
-        for row in rows:
-            vector = _unpack_vector(row[8], row[7])
-            score = _cosine_similarity(query_vector, vector)
-            if score > 0:
-                scored.append((score, row))
-        scored.sort(key=lambda item: item[0], reverse=True)
+        index = self._vector_index(scope, self.embedding_provider.model_name)
 
         hits = []
-        for score, row in scored[:limit]:
+        for score, row in index.top(query_vector, limit):
             heading = row[3] or row[2]
             locator = row[5]
             if heading and heading != row[2]:
@@ -759,6 +797,41 @@ class MemoryHub:
                 )
             )
         return hits
+
+    def _vector_index(self, scope: str, model_name: str) -> "_VectorIndex":
+        """Return the in-memory vector matrix for a scope, rebuilding it only when stale.
+
+        Unpacking every BLOB and scoring it in pure Python on each query was
+        O(N·d) interpreter work. The version key is a cheap aggregate that
+        changes on any vector insert/delete and on every sync, so a sync from
+        another process (``python -m memory_hub --sync-only``) is picked up too.
+        """
+        with self._connect(scope) as connection:
+            count, max_rowid = connection.execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM vectors WHERE model = ?",
+                (model_name,),
+            ).fetchone()
+            last_sync = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'last_sync'"
+            ).fetchone()
+            version = (model_name, int(count), int(max_rowid), last_sync[0] if last_sync else None)
+            cached = self._vector_cache.get(scope)
+            if cached is not None and cached[0] == version:
+                return cached[1]
+            rows = connection.execute(
+                """
+                SELECT c.chunk_id, s.source_path, s.title, c.heading, c.content,
+                       s.source_key, s.obsidian_uri, v.dimension, v.vector
+                FROM vectors v
+                JOIN chunks c ON c.chunk_id = v.chunk_id
+                JOIN sources s ON s.source_key = c.source_key
+                WHERE v.model = ?
+                """,
+                (model_name,),
+            ).fetchall()
+        index = _VectorIndex(rows)
+        self._vector_cache[scope] = (version, index)
+        return index
 
     @contextmanager
     def _connect(self, scope: str) -> Iterator[sqlite3.Connection]:
@@ -794,6 +867,13 @@ class MemoryHub:
                     dimension INTEGER NOT NULL,
                     vector BLOB NOT NULL,
                     PRIMARY KEY(chunk_id, model)
+                );
+                CREATE TABLE IF NOT EXISTS embedding_cache (
+                    model TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    vector BLOB NOT NULL,
+                    PRIMARY KEY(model, content_hash)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                     content,
@@ -837,6 +917,10 @@ def _file_hash(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _chunk_markdown(text: str, chunk_size: int, overlap: int) -> Iterator[tuple[str, str]]:
@@ -914,6 +998,71 @@ def _unpack_vector(payload: bytes, dimension: int) -> list[float]:
     if len(values) != dimension:
         raise RuntimeError("stored vector dimension does not match its metadata")
     return list(values)
+
+
+class _VectorIndex:
+    """Immutable snapshot of a scope's vectors for fast cosine top-k.
+
+    Rows are ``(chunk_id, source_path, title, heading, content, source_key,
+    obsidian_uri, dimension, vector_blob)``. With numpy each dimension group is
+    one L2-normalised matrix, so a query is a single mat-vec product; without
+    numpy it falls back to the original pure-Python scan.
+    """
+
+    def __init__(self, rows: Sequence[Sequence[object]]) -> None:
+        self._rows = [tuple(row[:7]) for row in rows]
+        self._vectors: list[list[float]] = []
+        self._groups: dict[int, tuple[list[int], object]] = {}
+        by_dimension: dict[int, list[int]] = {}
+        for position, row in enumerate(rows):
+            dimension = int(row[7])
+            by_dimension.setdefault(dimension, []).append(position)
+            if _np is None:
+                self._vectors.append(_unpack_vector(row[8], dimension))
+        if _np is not None:
+            for dimension, positions in by_dimension.items():
+                matrix = _np.vstack(
+                    [_np.frombuffer(rows[position][8], dtype=_np.float32) for position in positions]
+                ).astype(_np.float64)
+                if matrix.shape[1] != dimension:
+                    raise RuntimeError("stored vector dimension does not match its metadata")
+                norms = _np.linalg.norm(matrix, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                self._groups[dimension] = (positions, matrix / norms)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def top(self, query_vector: Sequence[float], limit: int) -> list[tuple[float, tuple]]:
+        """Return up to ``limit`` ``(score, row)`` pairs with positive cosine score."""
+        if not self._rows or limit <= 0:
+            return []
+        if _np is None:
+            scored = []
+            for row, vector in zip(self._rows, self._vectors):
+                score = _cosine_similarity(query_vector, vector)
+                if score > 0:
+                    scored.append((score, row))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            return scored[:limit]
+
+        group = self._groups.get(len(query_vector))
+        if group is None:
+            return []
+        positions, matrix = group
+        query = _np.asarray(query_vector, dtype=_np.float64)
+        norm = float(_np.linalg.norm(query))
+        if norm == 0:
+            return []
+        scores = matrix @ (query / norm)
+        count = min(limit, len(scores))
+        candidates = _np.argpartition(-scores, count - 1)[:count]
+        ordered = candidates[_np.argsort(-scores[candidates], kind="stable")]
+        return [
+            (float(scores[index]), self._rows[positions[index]])
+            for index in ordered
+            if scores[index] > 0
+        ]
 
 
 def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:

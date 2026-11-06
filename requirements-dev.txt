@@ -1,0 +1,9 @@
+# 开发与测试依赖（运行时依赖见 requirements.txt）
+-r requirements.txt
+
+# FastAPI TestClient 与 ASGI 并发测试
+httpx>=0.27.0
+
+# 可选：测试本身用 unittest 编写，pytest 只是更友好的运行器
+#   python -m unittest discover -s tests -t .
+pytest>=8.0.0

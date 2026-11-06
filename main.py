@@ -86,9 +86,121 @@ app_state = AppState()
 # 核心功能函数
 # ============================================================
 
+# 上传文件写入共享 Chroma 集合时使用的标记：可按 course_id / doc_id 删除，
+# 与 SecondBrain 同步（source_kind=filesystem）和课策文档（origin=kece）区分开。
+UPLOAD_COURSE_ID = "__upload__"
+UPLOAD_ORIGIN = "upload"
+
+
+def _initialize_runtime(manager: VectorStoreManager) -> int:
+    """从向量库完整快照重建检索器、BM25、QA 链和工作流，返回文本块数。
+
+    构建、加载、上传后都走这里，保证向量检索与 BM25 覆盖同一批文档
+    （此前构建只用本次上传的块建 BM25，库里已有的内容只在向量侧可见）。
+    """
+    vectorstore = manager.get_vectorstore()
+    result = manager.get_snapshot()
+    documents = result.get("documents", []) or []
+    metadatas = result.get("metadatas", []) or []
+    chunks = [
+        Document(page_content=content, metadata=(metadatas[i] if i < len(metadatas) else {}) or {})
+        for i, content in enumerate(documents)
+        if content
+    ]
+
+    reranker = None
+    if config.ENABLE_RERANKER:
+        try:
+            reranker = Reranker()
+        except Exception as e:
+            print(f"⚠️ 重排序器初始化失败，将使用基础检索: {e}")
+
+    retriever = SmartRetriever(vectorstore=vectorstore, reranker=reranker)
+    app_state.vectorstore_manager = manager
+    app_state.qa_chain = QAChain(retriever=retriever)
+    app_state.bm25_retriever = BM25Retriever()
+    app_state.bm25_retriever.build_index(chunks)
+    app_state.hybrid_retriever = HybridRetriever(
+        bm25_retriever=app_state.bm25_retriever,
+        vector_retriever=retriever,
+    )
+    app_state.memory = ConversationMemory()
+    app_state.workflow = RAGWorkflow(
+        retriever=retriever,
+        hybrid_retriever=app_state.hybrid_retriever,
+        query_rewriter=QueryRewriter(),
+        memory=app_state.memory,
+    )
+    app_state._chunks = chunks
+    app_state.doc_count = len(chunks)
+    app_state.status = "已就绪"
+    return len(chunks)
+
+
+def ingest_uploaded_files(uploads: List[Tuple[str, str]]) -> dict:
+    """把上传的文件追加进知识库；同名文件替换旧版本。
+
+    Args:
+        uploads: [(落盘路径, 原始文件名)]。原始文件名用于引用展示和去重，
+            避免引用里出现临时文件名。
+
+    Returns:
+        dict: {"files": int, "raw_docs": int, "added_chunks": int,
+               "removed_chunks": int, "doc_count": int}
+    """
+    raw_docs: List[Document] = []
+    names: List[str] = []
+    for path, display_name in uploads:
+        name = os.path.basename(display_name) or os.path.basename(path)
+        loaded = app_state.loader.load_file(path)
+        if not loaded:
+            continue
+        names.append(name)
+        for doc in loaded:
+            doc.metadata = {
+                **doc.metadata,
+                "source": f"upload::{name}",
+                "file_name": name,
+                "course_id": UPLOAD_COURSE_ID,
+                "doc_id": name,
+                "origin": UPLOAD_ORIGIN,
+                "source_kind": UPLOAD_ORIGIN,
+            }
+            raw_docs.append(doc)
+
+    if not raw_docs:
+        return {
+            "files": 0,
+            "raw_docs": 0,
+            "added_chunks": 0,
+            "removed_chunks": 0,
+            "doc_count": app_state.doc_count,
+        }
+
+    chunks = app_state.splitter.split_documents(raw_docs)
+    manager = app_state.vectorstore_manager or VectorStoreManager()
+    if manager.vectorstore is None:
+        manager.open()
+
+    removed = 0
+    for name in dict.fromkeys(names):
+        removed += manager.delete_by_metadata(
+            {"$and": [{"course_id": UPLOAD_COURSE_ID}, {"doc_id": name}]}
+        )
+    manager.add_documents(chunks)
+    doc_count = _initialize_runtime(manager)
+    return {
+        "files": len(set(names)),
+        "raw_docs": len(raw_docs),
+        "added_chunks": len(chunks),
+        "removed_chunks": removed,
+        "doc_count": doc_count,
+    }
+
+
 def build_knowledge_base(files: List[str]) -> str:
     """
-    从上传的文件构建知识库
+    把上传的文件写入知识库（追加；同名文件替换旧版本）
 
     Args:
         files: Gradio 上传的文件路径列表
@@ -100,76 +212,25 @@ def build_knowledge_base(files: List[str]) -> str:
         return "⚠️ 请先上传文件"
 
     try:
-        # 1. 加载文档
-        all_docs = []
-        for file_path in files:
-            docs = app_state.loader.load_file(file_path)
-            all_docs.extend(docs)
-
-        if not all_docs:
+        result = ingest_uploaded_files(
+            [(file_path, os.path.basename(file_path)) for file_path in files]
+        )
+        if not result["added_chunks"]:
             return "⚠️ 上传的文件中没有提取到有效内容"
 
-        # 2. 分块
-        chunks = app_state.splitter.split_documents(all_docs)
-
-        # 3. 构建向量数据库
-        app_state.vectorstore_manager = VectorStoreManager()
-        app_state.vectorstore_manager.create_from_documents(chunks)
-
-        # 4. 初始化检索器和 QA 链
-        vectorstore = app_state.vectorstore_manager.get_vectorstore()
-
-        reranker = None
-        if config.ENABLE_RERANKER:
-            try:
-                reranker = Reranker()
-            except Exception as e:
-                print(f"⚠️ 重排序器初始化失败，将使用基础检索: {e}")
-
-        retriever = SmartRetriever(
-            vectorstore=vectorstore,
-            reranker=reranker,
-        )
-
-        app_state.qa_chain = QAChain(retriever=retriever)
-        app_state.doc_count = len(chunks)
-        app_state.status = "已就绪"
-
-        # 5. 构建 BM25 索引（用于混合检索）
-        app_state.bm25_retriever = BM25Retriever()
-        app_state.bm25_retriever.build_index(chunks)
-
-        # 6. 初始化混合检索器
-        app_state.hybrid_retriever = HybridRetriever(
-            bm25_retriever=app_state.bm25_retriever,
-            vector_retriever=retriever,
-        )
-
-        # 7. 初始化对话记忆
-        app_state.memory = ConversationMemory()
-
-        # 8. 初始化 LangGraph 工作流
-        query_rewriter = QueryRewriter()
-        app_state.workflow = RAGWorkflow(
-            retriever=retriever,
-            hybrid_retriever=app_state.hybrid_retriever,
-            query_rewriter=query_rewriter,
-            memory=app_state.memory,
-        )
-
-        # 保留分块结果
-        app_state._chunks = chunks
-
-        # 统计信息
-        stats = app_state.splitter.get_stats(all_docs, chunks)
         vs_stats = app_state.vectorstore_manager.get_stats()
-
+        replaced = (
+            f"- 替换同名旧版本: {result['removed_chunks']} 个块\n"
+            if result["removed_chunks"]
+            else ""
+        )
         return (
-            f"✅ 知识库构建成功！\n\n"
+            f"✅ 知识库更新成功！\n\n"
             f"📊 **构建统计**\n"
-            f"- 原始文档数: {stats['原始文档数']}\n"
-            f"- 分块总数: {stats['分块总数']}\n"
-            f"- 平均块大小: {stats['平均块大小']:.0f} 字符\n"
+            f"- 上传文件数: {result['files']}\n"
+            f"- 新增文本块: {result['added_chunks']}\n"
+            f"{replaced}"
+            f"- 知识库总块数: {result['doc_count']}\n"
             f"- 向量总数: {vs_stats['向量总数']}\n"
             f"- 存储路径: {vs_stats['存储路径']}\n\n"
             f"🎯 现在可以在「问答」标签页中提问了！"
@@ -188,61 +249,13 @@ def auto_load_knowledge_base():
 
     try:
         print("[auto-load] 正在加载已有知识库...")
-
-        # 1. 加载 ChromaDB
-        app_state.vectorstore_manager = VectorStoreManager()
-        vectorstore = app_state.vectorstore_manager.load()
-
-        # 2. 从 ChromaDB 获取所有文档块（用于 BM25 索引）
-        collection = vectorstore._collection
-        result = collection.get(include=["documents", "metadatas"])
-
-        chunks = []
-        for i, doc_id in enumerate(result.get("ids", [])):
-            content = result["documents"][i] if i < len(result.get("documents", [])) else ""
-            metadata = result["metadatas"][i] if i < len(result.get("metadatas", [])) else {}
-            if content:
-                chunks.append(Document(page_content=content, metadata=metadata))
-
-        if not chunks:
+        manager = VectorStoreManager()
+        manager.load()
+        if manager.count() == 0:
             print("[auto-load] 知识库为空")
             return False
-
-        # 3. 初始化检索器
-        reranker = None
-        if config.ENABLE_RERANKER:
-            try:
-                reranker = Reranker()
-            except Exception as e:
-                print(f"[auto-load] 重排序器初始化失败: {e}")
-
-        retriever = SmartRetriever(vectorstore=vectorstore, reranker=reranker)
-        app_state.qa_chain = QAChain(retriever=retriever)
-
-        # 4. 构建 BM25 索引
-        app_state.bm25_retriever = BM25Retriever()
-        app_state.bm25_retriever.build_index(chunks)
-
-        # 5. 初始化混合检索器
-        app_state.hybrid_retriever = HybridRetriever(
-            bm25_retriever=app_state.bm25_retriever,
-            vector_retriever=retriever,
-        )
-
-        # 6. 初始化其他组件
-        app_state.memory = ConversationMemory()
-        app_state.workflow = RAGWorkflow(
-            retriever=retriever,
-            hybrid_retriever=app_state.hybrid_retriever,
-            query_rewriter=QueryRewriter(),
-            memory=app_state.memory,
-        )
-
-        app_state._chunks = chunks
-        app_state.doc_count = len(chunks)
-        app_state.status = "已就绪"
-
-        print(f"[auto-load] 知识库加载完成，共 {len(chunks)} 个文本块")
+        count = _initialize_runtime(manager)
+        print(f"[auto-load] 知识库加载完成，共 {count} 个文本块")
         return True
 
     except Exception as e:
@@ -254,14 +267,17 @@ def clear_knowledge_base() -> str:
     """
     清空知识库
 
-    删除 ChromaDB 持久化目录，重置所有应用状态。
+    删除集合中的全部向量并重置应用状态。不删除持久化目录：RAG MCP 服务
+    等其他进程可能正打开着同一个 Chroma 库，Windows 上 rmtree 会删到一半
+    失败、留下损坏的索引。
     """
     try:
-        # 删除向量数据库文件夹
-        chroma_dir = config.CHROMA_PERSIST_DIR
-        if os.path.exists(chroma_dir):
-            shutil.rmtree(chroma_dir)
-            print(f"已删除向量数据库: {chroma_dir}")
+        manager = app_state.vectorstore_manager
+        if manager is None and os.path.exists(config.CHROMA_PERSIST_DIR):
+            manager = VectorStoreManager()
+            manager.load()
+        if manager is not None:
+            manager.delete()
 
         # 重置应用状态
         app_state.vectorstore_manager = None
@@ -276,8 +292,9 @@ def clear_knowledge_base() -> str:
 
         return (
             "🗑️ 知识库已清空！\n\n"
-            "向量数据库和应用状态已全部重置。\n"
-            "你可以重新上传文档并构建知识库。"
+            "向量数据和应用状态已全部重置。\n"
+            "SecondBrain 笔记会在下次 sync_knowledge_base 时重新入库；"
+            "也可以重新上传文档。"
         )
 
     except Exception as e:
@@ -1056,16 +1073,35 @@ if __name__ == "__main__":
     app = create_app()
 
     # 创建 FastAPI 并挂载到同一个服务上
-    fastapi_app = create_api(app_state, kb_add_documents, kb_delete_documents)
+    fastapi_app = create_api(
+        app_state,
+        kb_add_documents,
+        kb_delete_documents,
+        build_documents_fn=ingest_uploaded_files,
+        clear_fn=clear_knowledge_base,
+    )
     app = gr.mount_gradio_app(fastapi_app, app, path="/")
 
     # 启动时自动加载已有知识库
     auto_load_knowledge_base()
 
-    # 启动（API 文档访问: http://localhost:7860/docs）
+    # 启动（默认只监听本机；开放局域网见 config.py 的 RAG_WEB_HOST 说明）
     import uvicorn
-    print("\n🌐 Web UI:  http://localhost:7860")
-    print("📡 API 文档: http://localhost:7860/docs")
-    print("📡 API 测试: curl -X POST http://localhost:7860/api/ask -H 'Content-Type: application/json' -d '{\"question\": \"什么是RAG\"}'\n")
+    import http_guard
 
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    host, port = config.RAG_WEB_HOST, config.RAG_WEB_PORT
+    display_host = f"[{host}]" if ":" in host else host
+    if not http_guard.is_loopback_host(host):
+        print(f"⚠️ RAG Web 服务监听 {host}，知识库内容可被局域网访问。")
+        if not config.RAG_ALLOWED_HOSTS:
+            print("⚠️ 未设置 RAG_ALLOWED_HOSTS：非本机 Host 的请求都会被 403 拒绝。")
+        if not config.RAG_API_TOKEN:
+            print("⚠️ 未设置 RAG_API_TOKEN：/api/* 没有鉴权，强烈建议设置。")
+    print(f"\n🌐 Web UI:  http://{display_host}:{port}")
+    print(f"📡 API 文档: http://{display_host}:{port}/docs")
+    print(
+        f"📡 API 测试: curl -X POST http://{display_host}:{port}/api/ask "
+        "-H 'Content-Type: application/json' -d '{\"question\": \"什么是RAG\"}'\n"
+    )
+
+    uvicorn.run(app, host=host, port=port)

@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # The project is developed and deployed on Windows (paths, Chroma file
+    # locking); Ubuntu keeps the code honest about portability.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      # Tests never call real providers; dummy values keep imports quiet.
+      OPENAI_API_KEY: sk-test-not-used
+      SILICONFLOW_API_KEY: ""
+      ENABLE_RERANKER: "false"
+      MEMORY_VECTOR_ENABLED: "false"
+      MEMORY_RERANK_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        # CPU-only torch: sentence-transformers otherwise pulls multi-GB CUDA wheels.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-dev.txt
+
+      - name: Knowledge base and memory hub tests
+        run: python -m pytest -q tests
+
+      - name: Memory recall skill tests
+        working-directory: agent-skill/personal-memory-recall-skill
+        run: python -m pytest -q tests

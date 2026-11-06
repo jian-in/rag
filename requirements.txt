@@ -28,6 +28,7 @@ python-multipart>=0.0.6
 
 # === Hybrid Search ===
 rank_bm25>=0.2.2
+jieba>=0.42.1  # BM25 中文分词（retrieval/hybrid_retriever.py）
 
 # === LangGraph Workflow ===
 langgraph>=0.2.0
