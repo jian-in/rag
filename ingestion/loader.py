@@ -119,16 +119,26 @@ class DocumentLoader:
                 docs.append(Document(page_content=text.strip(), metadata=metadata))
         return docs
 
+    def _read_file_text(self, path: Path) -> str:
+        """带编码降级与 BOM 容错的文本读取"""
+        try:
+            return path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                return path.read_text(encoding="gb18030")
+            except UnicodeDecodeError:
+                return path.read_text(encoding="utf-8", errors="replace")
+
     def _load_text(self, path: Path, base_metadata: dict) -> List[Document]:
         """加载纯文本文件"""
-        text = path.read_text(encoding="utf-8")
+        text = self._read_file_text(path)
         if text.strip():
             return [Document(page_content=text.strip(), metadata=base_metadata)]
         return []
 
     def _load_markdown(self, path: Path, base_metadata: dict) -> List[Document]:
         """加载 Markdown 文件"""
-        text = path.read_text(encoding="utf-8")
+        text = self._read_file_text(path)
         if text.strip():
             return [Document(page_content=text.strip(), metadata=base_metadata)]
         return []

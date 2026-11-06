@@ -10,7 +10,8 @@ RAG 系统的核心组件，将检索、Prompt 组装和 LLM 调用串联起来�
   - 可扩展性设计（方便切换 LLM、添加后处理等）
 """
 
-from typing import List, Optional, Tuple
+import hashlib
+from typing import Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -173,23 +174,33 @@ class QAChain:
         queries: List[str],
         strategy: str = "mmr",
         use_reranker: bool = config.ENABLE_RERANKER,
+        rrf_k: int = 60,
     ) -> List[Document]:
         """
-        多查询检索：对每个查询分别检索，然后合并去重
+        多查询检索：对每个查询分别检索，并使用倒数排名融合（RRF）去重排序
 
         这是工业界常用的技巧——不同角度的查询能召回不同方面的文档，
-        合并后覆盖面更广，答案质量更高。
+        通过 RRF 融合能够使多个查询交叉召回的高相关文档排在前面。
 
         Args:
             queries: 查询列表
             strategy: 检索策略
             use_reranker: 是否使用重排序
+            rrf_k: RRF 平滑系数（默认 60）
 
         Returns:
-            List[Document]: 合并去重后的文档列表
+            List[Document]: 合并融合排序后的文档列表
         """
-        all_docs = []
-        seen_content = set()
+        def _doc_key(doc: Document) -> str:
+            md = doc.metadata or {}
+            source = str(md.get("source", ""))
+            page = str(md.get("page", ""))
+            chunk_index = str(md.get("chunk_index", ""))
+            content_hash = hashlib.sha256(doc.page_content.encode("utf-8")).hexdigest()[:16]
+            return f"{source}::{page}::{chunk_index}::{content_hash}"
+
+        rrf_scores: Dict[str, float] = {}
+        doc_map: Dict[str, Document] = {}
 
         for query in queries:
             docs = self.retriever.retrieve(
@@ -197,15 +208,16 @@ class QAChain:
                 strategy=strategy,
                 use_reranker=use_reranker,
             )
-            for doc in docs:
-                # 用内容前100字符做简单去重
-                content_key = doc.page_content[:100]
-                if content_key not in seen_content:
-                    seen_content.add(content_key)
-                    all_docs.append(doc)
+            for rank, doc in enumerate(docs, start=1):
+                key = _doc_key(doc)
+                rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (rrf_k + rank)
+                doc_map.setdefault(key, doc)
 
-        print(f"📚 多路检索合并: {len(queries)} 个查询 → {len(all_docs)} 个不重复文档")
-        return all_docs
+        sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
+        results = [doc_map[k] for k in sorted_keys]
+
+        print(f"📚 多路检索合并(RRF): {len(queries)} 个查询 → {len(results)} 个不重复文档")
+        return results
 
     def _answer_no_context(self, question: str) -> str:
         """
