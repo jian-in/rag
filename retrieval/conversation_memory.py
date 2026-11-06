@@ -159,16 +159,29 @@ class ConversationMemory:
             f"用户: {t['user']}\n助手: {t['assistant']}" for t in old_turns
         )
 
-        prompt = ChatPromptTemplate.from_template(
-            "请将以下对话内容压缩为一段简短的摘要（100字以内），保留关键信息：\n\n{conversation}\n\n摘要："
-        )
+        try:
+            if self.summary:
+                conversation_payload = (
+                    f"[已有历史摘要]\n{self.summary}\n\n"
+                    f"[新增待归纳对话]\n{old_text}"
+                )
+                prompt = ChatPromptTemplate.from_template(
+                    "请将已有历史摘要与新增待归纳对话整合压缩为一段简明连贯的摘要（150字以内），保留核心事实与脉络：\n\n{conversation}\n\n整合摘要："
+                )
+            else:
+                conversation_payload = old_text
+                prompt = ChatPromptTemplate.from_template(
+                    "请将以下对话内容压缩为一段简短的摘要（100字以内），保留关键信息：\n\n{conversation}\n\n摘要："
+                )
 
-        messages = prompt.format_messages(conversation=old_text)
-        response = self.llm.invoke(messages)
+            messages = prompt.format_messages(conversation=conversation_payload)
+            response = self.llm.invoke(messages)
 
-        self.summary = response.content.strip()
-        self.history = deque(recent_turns, maxlen=self.max_turns)
-        print(f"Compressed {len(old_turns)} old turns into summary")
+            self.summary = response.content.strip()
+            self.history = deque(recent_turns, maxlen=self.max_turns)
+            print(f"Compressed {len(old_turns)} old turns into summary")
+        except Exception as exc:
+            print(f"⚠️ 压缩对话历史失败，保留现有历史: {exc}")
 
     def clear(self):
         """清空对话历史"""

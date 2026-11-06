@@ -14,6 +14,7 @@
      用这个答案去检索，比直接用问题检索效果更好
 """
 
+import re
 from typing import List, Optional
 
 from langchain_openai import ChatOpenAI
@@ -124,12 +125,15 @@ class QueryRewriter:
         messages = prompt.format_messages(query=query)
         response = self.llm.invoke(messages)
 
-        # 按行分割，过滤空行
-        sub_queries = [
-            line.strip()
-            for line in response.content.strip().split("\n")
-            if line.strip()
-        ]
+        # 按行分割，过滤空行并清洗常见的 1. / 2、/ - / * 等前缀
+        sub_queries = []
+        for line in response.content.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            cleaned = re.sub(r"^(?:[0-9]+[.\、\)\s]+|[-*•]\s*)", "", line).strip()
+            if cleaned:
+                sub_queries.append(cleaned)
 
         # 至少返回一个问题
         if not sub_queries:
@@ -163,7 +167,7 @@ class QueryRewriter:
         self, query: str, strategy: str = "expand"
     ) -> List[str]:
         """
-        统一改写接口
+        统一改写接口，支持异常降级回退原始查询
 
         Args:
             query: 原始查询
@@ -173,20 +177,24 @@ class QueryRewriter:
             List[str]: 改写后的查询列表
                       （expand/hyde 返回1个，decompose 可能返回多个）
         """
-        if strategy == "expand":
-            rewritten = self.expand(query)
-            print(f"🔄 查询改写(expand): '{query}' → '{rewritten}'")
-            return [rewritten]
+        try:
+            if strategy == "expand":
+                rewritten = self.expand(query)
+                print(f"🔄 查询改写(expand): '{query}' → '{rewritten}'")
+                return [rewritten] if rewritten else [query]
 
-        elif strategy == "decompose":
-            sub_queries = self.decompose(query)
-            print(f"🔄 查询改写(decompose): '{query}' → {sub_queries}")
-            return sub_queries
+            elif strategy == "decompose":
+                sub_queries = self.decompose(query)
+                print(f"🔄 查询改写(decompose): '{query}' → {sub_queries}")
+                return sub_queries if sub_queries else [query]
 
-        elif strategy == "hyde":
-            hypothetical = self.hyde(query)
-            print(f"🔄 查询改写(hyde): 生成了假设性文档")
-            return [hypothetical]
+            elif strategy == "hyde":
+                hypothetical = self.hyde(query)
+                print(f"🔄 查询改写(hyde): 生成了假设性文档")
+                return [hypothetical] if hypothetical else [query]
 
-        else:
-            raise ValueError(f"不支持的改写策略: {strategy}")
+            else:
+                raise ValueError(f"不支持的改写策略: {strategy}")
+        except Exception as exc:
+            print(f"⚠️ 查询改写失败，降级回退到原始查询: {exc}")
+            return [query]

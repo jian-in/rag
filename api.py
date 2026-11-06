@@ -228,12 +228,19 @@ def create_api(
                 sources=[],
             )
 
+        cleaned_question = (request.question or "").strip()
+        if not cleaned_question:
+            return AskResponse(
+                answer="提问失败: 问题不能为空。",
+                sources=[],
+            )
+
         try:
             # 对话记忆改写
-            actual_query = request.question
+            actual_query = cleaned_question
             if request.use_memory and app_state.memory:
                 actual_query = app_state.memory.rewrite_query_with_history(
-                    request.question
+                    cleaned_question
                 )
 
             # 检索 + 生成
@@ -352,20 +359,26 @@ def create_api(
             POST /api/retrieve
             {"query": "进程调度算法", "top_k": 5, "use_hybrid": true}
         """
+        cleaned_query = (request.query or "").strip()
+        if not cleaned_query:
+            return RetrieveResponse(query="", results=[], total=0)
+
         if not app_state.is_ready():
-            return RetrieveResponse(query=request.query, results=[], total=0)
+            return RetrieveResponse(query=cleaned_query, results=[], total=0)
+
+        bounded_top_k = max(1, min(50, int(request.top_k or 5)))
 
         try:
             if request.use_hybrid and app_state.hybrid_retriever:
                 docs = app_state.hybrid_retriever.search(
-                    request.query, top_k=request.top_k
+                    cleaned_query, top_k=bounded_top_k
                 )
             elif app_state.qa_chain and app_state.qa_chain.retriever:
                 docs = app_state.qa_chain.retriever.retrieve(
-                    request.query, top_k=request.top_k
+                    cleaned_query, top_k=bounded_top_k
                 )
             else:
-                return RetrieveResponse(query=request.query, results=[], total=0)
+                return RetrieveResponse(query=cleaned_query, results=[], total=0)
 
             results = []
             for doc in docs:
