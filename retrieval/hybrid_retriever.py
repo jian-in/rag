@@ -20,10 +20,18 @@ class BM25Retriever:
     def build_index(self, documents: List[Document]):
         from rank_bm25 import BM25Okapi
 
-        self._documents = documents
-        tokenized_docs = [self._tokenize(self._document_text(doc)) for doc in documents]
+        self._documents = list(documents)
+        # BM25Okapi 对空语料会 ZeroDivisionError（平均文档长度为 0）。
+        # 空语料是合法状态（知识库被清空），此时应回到「无索引」语义，
+        # 而不是让调用方用守卫绕行——绕行会让索引停留在陈旧状态。
+        if not self._documents:
+            self._index = None
+            print("BM25 index cleared (empty corpus)")
+            return
+
+        tokenized_docs = [self._tokenize(self._document_text(doc)) for doc in self._documents]
         self._index = BM25Okapi(tokenized_docs)
-        print(f"BM25 index built with {len(documents)} chunks")
+        print(f"BM25 index built with {len(self._documents)} chunks")
 
     def search(self, query: str, top_k: int = config.RETRIEVAL_TOP_K) -> List[Document]:
         if self._index is None:

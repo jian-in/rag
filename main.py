@@ -375,7 +375,10 @@ def kb_delete_documents(course_id: str = None, doc_id: str = None) -> dict:
         return True
 
     app_state._chunks = [c for c in app_state._chunks if not _match(c.metadata)]
-    if app_state.bm25_retriever is not None and app_state._chunks:
+    # 无条件重建：build_index 现在能处理空语料（清空索引），
+    # 旧守卫 `and app_state._chunks` 会让「删到空库」时索引保持陈旧，
+    # 已删除的文档仍会被 BM25 召回。
+    if app_state.bm25_retriever is not None:
         app_state.bm25_retriever.build_index(app_state._chunks)
     app_state.doc_count = len(app_state._chunks)
 

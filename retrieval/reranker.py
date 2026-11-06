@@ -94,8 +94,14 @@ class Reranker:
         reranked = []
         for item in results.results:
             doc = documents[item.index]
-            doc.metadata["rerank_score"] = item.relevance_score
-            reranked.append(doc)
+            # 写副本而非原对象：检索结果在调用方仍被引用，
+            # 就地改 metadata 会污染上游文档（见 tests/test_retrieval_logic.py 的不变量）。
+            reranked.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata={**doc.metadata, "rerank_score": item.relevance_score},
+                )
+            )
         return reranked
 
     def _rerank_cross_encoder(
@@ -108,8 +114,12 @@ class Reranker:
 
         reranked = []
         for score, doc in scored_docs[:top_n]:
-            doc.metadata["rerank_score"] = float(score)
-            reranked.append(doc)
+            reranked.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata={**doc.metadata, "rerank_score": float(score)},
+                )
+            )
         return reranked
 
     def _rerank_siliconflow(
@@ -151,6 +161,13 @@ class Reranker:
         reranked = []
         for item in data.get("results", []):
             doc = documents[item["index"]]
-            doc.metadata["rerank_score"] = float(item.get("relevance_score", 0.0))
-            reranked.append(doc)
+            reranked.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata={
+                        **doc.metadata,
+                        "rerank_score": float(item.get("relevance_score", 0.0)),
+                    },
+                )
+            )
         return reranked
