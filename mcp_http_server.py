@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -238,12 +242,59 @@ async def sse_messages_alias(
     return await sse_messages(request, session_id)
 
 
+LOG_PATH = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "RagKnowledgeMCP" / "server.log"
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+
+
+def _attach_log_file_when_headless() -> Optional[Path]:
+    """Under pythonw (sign-in autostart) there is no console: send output to a log file.
+
+    Without this, sys.stdout/sys.stderr are None, every diagnostic is lost, and
+    uvicorn's default log config crashes at start-up calling sys.stdout.isatty().
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return None
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_ROTATE_BYTES:
+        LOG_PATH.replace(LOG_PATH.with_name(LOG_PATH.name + ".1"))
+    stream = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+    return LOG_PATH
+
+
+def _service_is_running(host: str, port: int) -> bool:
+    """Return whether this server already answers on the endpoint (avoids a second copy)."""
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    display_host = f"[{probe_host}]" if ":" in probe_host else probe_host
+    try:
+        with urlopen(f"http://{display_host}:{port}/health", timeout=0.75) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, ValueError):
+        return False
+    return payload.get("ok") is True and payload.get("server") == SERVER_NAME
+
+
 def main() -> int:
+    log_path = _attach_log_file_when_headless()
     host = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
     # 与 start_mcp_server.bat 和各客户端配置（http://127.0.0.1:8766/mcp）保持一致
     port = int(os.getenv("MCP_HTTP_PORT", "8766"))
+    if _service_is_running(host, port):
+        log(f"{SERVER_NAME} is already running on port {port}; not starting a second copy.")
+        return 0
     log(f"{SERVER_NAME} HTTP MCP server listening on http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="warning",
+        # uvicorn's default formatter probes the console; headless runs log via
+        # the standard logging fallback into the log file instead.
+        **({"log_config": None} if log_path is not None else {}),
+    )
     return 0
 
 

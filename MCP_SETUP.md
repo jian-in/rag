@@ -14,14 +14,25 @@ clients should use `/sse` instead.
 
 ### 1. Start the HTTP MCP server
 
-Run this in PowerShell and keep the window open:
+Run this in PowerShell from the project root and keep the window open
+(the default port is `8766`):
 
 ```powershell
-$env:MCP_HTTP_PORT="8766"
-& "E:\Backup\rag-knowledge-base\RAG\Scripts\python.exe" -u "E:\Backup\rag-knowledge-base\mcp_http_server.py"
+& ".\RAG\Scripts\python.exe" -u ".\mcp_http_server.py"
 ```
 
-If `8766` is already occupied, change it to another free port such as `8767`.
+If `8766` is already occupied, set `$env:MCP_HTTP_PORT` to another free port such as `8767`.
+
+To start it silently at every Windows sign-in instead, register a Startup-folder
+shortcut (`-Start` also launches it now). Without a console, output goes to
+`%LOCALAPPDATA%\RagKnowledgeMCP\server.log`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-rag-mcp.ps1 -Start
+```
+
+Stop it with `.\scripts\stop-rag-mcp.ps1`. The personal memory hub (8771) has the
+matching `scripts\install-memory-hub.ps1` / `scripts\stop-memory-hub.ps1`.
 
 ### 2. Configure the MCP client
 
