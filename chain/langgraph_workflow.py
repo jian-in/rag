@@ -18,6 +18,7 @@ LangGraph vs 普通 Chain 的区别：
          A -> (判断) -> B 或 C -> (质量检查不通过?) -> 回到 A
 """
 
+import re
 from typing import TypedDict, List, Optional
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
@@ -25,6 +26,30 @@ from langchain_core.prompts import ChatPromptTemplate
 
 import config
 from chain.prompts import SYSTEM_PROMPT, QA_PROMPT_TEMPLATE
+
+
+def parse_label(text: str, labels, default: str) -> str:
+    """从 LLM 的分类回答里取出标签。
+
+    模型常回答 "poor."、"Poor。"、"答案质量：poor" 甚至整句解释；只接受完全
+    相等的字符串时这些全被当成默认值，自我纠错的重试和深度检索路径几乎从不
+    触发。这里按 ``labels`` 的顺序查找关键词（靠前的优先），都没找到才用默认值。
+
+    Args:
+        text: LLM 原始回答
+        labels: [(标签, (关键词, ...)), ...]，按优先级排列
+        default: 未识别时的标签
+    """
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    for label, keywords in labels:
+        for keyword in keywords:
+            # 英文关键词按词边界匹配，避免 "goodness"/"simplest" 之类误判
+            if re.fullmatch(r"[a-z -]+", keyword):
+                if re.search(rf"(?<![a-z]){re.escape(keyword)}(?![a-z])", normalized):
+                    return label
+            elif keyword in normalized:
+                return label
+    return default
 
 
 # ============================================================
@@ -128,10 +153,14 @@ class RAGWorkflow:
 
         messages = prompt.format_messages(first_query=state["original_query"])
         response = self.llm.invoke(messages)
-        query_type = response.content.strip().lower()
-
-        if query_type not in ("simple", "complex", "multi-step"):
-            query_type = "simple"
+        query_type = parse_label(
+            response.content,
+            # 先匹配更具体的标签："multi-step" 的说明文字里也可能出现 complex
+            (("multi-step", ("multi-step", "multi step", "multistep", "多步")),
+             ("complex", ("complex", "复杂")),
+             ("simple", ("simple", "简单"))),
+            default="simple",
+        )
 
         print(f"[LangGraph] Query type: {query_type}")
         return {
@@ -264,10 +293,13 @@ class RAGWorkflow:
             answer=state.get("answer", ""),
         )
         response = self.llm.invoke(messages)
-        quality = response.content.strip().lower()
-
-        if quality not in ("good", "poor"):
-            quality = "good"
+        # "poor" 优先：「not good」「不够好」这类否定说法也应判为 poor
+        quality = parse_label(
+            response.content,
+            (("poor", ("poor", "not good", "bad", "不好", "不够", "不充分", "差")),
+             ("good", ("good", "好", "充分"))),
+            default="good",
+        )
 
         print("[LangGraph] Quality check: " + quality)
         return {"answer_quality": quality}

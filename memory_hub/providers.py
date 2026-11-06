@@ -148,6 +148,8 @@ def providers_from_environment(
 
 
 def _enabled(value: str | None, *, default: bool) -> bool:
-    if value is None:
+    # 留空（如 .env 里写了 "MEMORY_VECTOR_ENABLED=" 却没填值）等同未设置：
+    # 此前空串不在关闭列表里，会被当成开启，把记忆文本发往外部服务。
+    if value is None or not value.strip():
         return default
     return value.strip().casefold() not in {"0", "false", "no", "off"}

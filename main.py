@@ -65,7 +65,7 @@ class AppState:
         self.use_memory: bool = False
         self.use_langgraph: bool = False
         self._chunks = []  # 保留分块结果，供 BM25 索引构建
-        self.evaluator: RAGEvaluator = None  # RAGAS 评估器
+        self.evaluator: RAGEvaluator = None  # LLM 裁判评估器（RAGAS 风格指标）
 
     def is_ready(self) -> bool:
         return self.qa_chain is not None
@@ -407,7 +407,7 @@ def run_quick_eval(question: str, ground_truth: str) -> str:
     """
     快速评估单条问答
 
-    在界面上输入问题和标准答案，系统自动生成答案并用 RAGAS 打分。
+    在界面上输入问题和标准答案，系统自动生成答案，并用 LLM 裁判按 RAGAS 风格指标打分。
 
     Args:
         question: 评估问题
@@ -457,6 +457,10 @@ def run_quick_eval(question: str, ground_truth: str) -> str:
                     "context_precision": "检索精度",
                 }.get(metric_name, metric_name)
                 output += f"{emoji} **{label}:** {score:.2%}\n\n"
+        if evaluator.errors:
+            output += "⚠️ **部分指标未能判定:**\n"
+            output += "".join(f"- {error}\n" for error in evaluator.errors)
+            output += "\n"
 
         output += "---\n"
         output += "📝 **指标说明:**\n"
@@ -466,8 +470,6 @@ def run_quick_eval(question: str, ground_truth: str) -> str:
 
         return output
 
-    except ImportError:
-        return "⚠️ 请先安装 ragas: `pip install ragas datasets`"
     except Exception as e:
         traceback.print_exc()
         return f"❌ 评估失败: {str(e)}"
@@ -557,10 +559,8 @@ def answer_question(
 
         # ---- 对话记忆：记录本轮 ----
         if use_memory and app_state.memory:
+            # 窗口满时 add_turn 会自动把旧对话压缩进摘要
             app_state.memory.add_turn(question, answer)
-            # 每 10 轮压缩一次旧对话
-            if app_state.memory.get_turn_count() >= 10:
-                app_state.memory.compress_old_turns(keep_recent=5)
 
         # 如果查询被改写了，在答案中提示
         if actual_query != question:
@@ -624,8 +624,6 @@ def stream_answer_question(
         # 对话记忆：记录本轮
         if use_memory and app_state.memory:
             app_state.memory.add_turn(question, full_answer)
-            if app_state.memory.get_turn_count() >= 10:
-                app_state.memory.compress_old_turns(keep_recent=5)
 
         # 如果查询被改写了，在答案中提示
         if actual_query != question:
@@ -1026,8 +1024,8 @@ def create_app() -> gr.Blocks:
             # ============================================================
             with gr.Tab("📊 评估测试", id="eval"):
                 gr.Markdown(
-                    "#### RAGAS 自动评估\n\n"
-                    "输入一个问题和标准答案，系统会自动生成回答并用 RAGAS 框架打分。\n"
+                    "#### 自动评估（RAGAS 风格指标）\n\n"
+                    "输入一个问题和标准答案，系统会自动生成回答，并由 LLM 裁判按忠实度、相关性、检索精度打分。\n"
                     "用于科学评估 RAG 系统的忠实度、相关性和检索精度。"
                 )
                 with gr.Row():

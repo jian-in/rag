@@ -17,8 +17,8 @@ cohere>=5.0.0
 sentence-transformers>=3.0.0
 
 # === Evaluation ===
-ragas>=0.2.0
-datasets>=2.20.0
+# 评估用项目自身的 LLM 做裁判（evaluation/evaluator.py），不再依赖 ragas/datasets：
+# ragas 0.4 依赖已从 langchain-community 0.4 移除的 vertexai 模块，无法导入。
 
 # === Web UI & API ===
 gradio>=5.0.0

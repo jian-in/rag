@@ -32,7 +32,7 @@
 | Embedding | text-embedding-3-small | 文本向量化 |
 | 重排序 | Cohere / Cross-Encoder | 检索精度优化 |
 | Web UI | Gradio | 交互式界面 |
-| 评估 | RAGAS | 系统效果量化评估 |
+| 评估 | LLM-as-judge（RAGAS 风格指标） | 系统效果量化评估 |
 
 ## 快速开始
 
@@ -103,7 +103,7 @@ rag-knowledge-base/
 │   ├── qa_chain.py          # QA 问答链
 │   └── prompts.py           # Prompt 模板
 ├── evaluation/
-│   └── evaluator.py         # RAGAS 评估模块
+│   └── evaluator.py         # LLM 裁判评估模块（RAGAS 风格指标）
 ├── data/
 │   └── sample_docs/         # 示例文档目录
 └── docs/
@@ -126,7 +126,7 @@ rag-knowledge-base/
 
 ### 评估体系
 
-基于 RAGAS 框架的量化评估，核心指标包括：
+用项目配置的 LLM 做裁判（LLM-as-judge），计算 RAGAS 风格的量化指标。不再依赖 ragas 包：ragas 0.4 与 langchain-community 0.4 不兼容，且不读取 OPENAI_API_BASE。核心指标包括：
 
 - **Faithfulness（忠实度）**：答案是否完全基于检索上下文，衡量幻觉程度
 - **Answer Relevancy（答案相关性）**：答案是否切题回答了问题

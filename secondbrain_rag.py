@@ -11,15 +11,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+import config  # noqa: E402  与增量同步共用同一套路径配置
+
 # ====== 配置 ======
-SECONDBRAIN_ROOT = r"C:\Desktop\SecondBrain"
-SECONDBRAIN_DIRS = [
-    r"C:\Desktop\SecondBrain\02-Areas",
-    r"C:\Desktop\SecondBrain\03-Resources",
-]
-CHROMA_DIR = r"E:\Backup\rag-knowledge-base\chroma_db"
+# 路径都从 config 读取（可用 .env 覆盖），不再写死机器路径：项目从
+# E:\Backup 迁移后，旧的硬编码会在已不存在的位置新建一个空库。
+SECONDBRAIN_ROOT = str(config.SECONDBRAIN_ROOT)
+SECONDBRAIN_DIRS = [os.path.join(SECONDBRAIN_ROOT, name) for name in config.SECONDBRAIN_INCLUDE_DIRS]
+_persist = config.CHROMA_PERSIST_DIR
+CHROMA_DIR = _persist if os.path.isabs(_persist) else os.path.normpath(os.path.join(ROOT, _persist))
 COLLECTION_NAME = "secondbrain"
-MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secondbrain_manifest.json")
+MANIFEST_PATH = os.path.join(ROOT, ".secondbrain_manifest.json")
 
 EMBEDDING_URL = "https://api.siliconflow.cn/v1/embeddings"
 EMBEDDING_API_KEY = os.getenv("SILICONFLOW_API_KEY") or os.getenv("EMBEDDING_API_KEY", "")
@@ -77,20 +81,27 @@ def file_hash(path: str) -> str:
         return hashlib.md5(fh.read()).hexdigest()
 
 
-def scan_files(base_dir: str) -> dict[str, str]:
-    """递归扫描 .md 文件，返回 {相对路径: 内容hash}"""
+def scan_files(base_dirs: list[str], root: str) -> dict[str, str]:
+    """递归扫描各目录下的 .md 文件，返回 {相对 root 的路径: 内容hash}
+
+    键相对 SecondBrain 根目录而不是各子目录，避免 02-Areas/x.md 与
+    03-Resources/x.md 互相覆盖。
+    """
     manifest = {}
-    for root, dirs, files in os.walk(base_dir):
-        # 跳过隐藏目录和非笔记目录
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for f in files:
-            if f.endswith(".md"):
-                path = os.path.join(root, f)
-                rel = os.path.relpath(path, base_dir)
-                try:
-                    manifest[rel] = file_hash(path)
-                except Exception:
-                    continue
+    for base_dir in base_dirs:
+        if not os.path.isdir(base_dir):
+            continue
+        for current, dirs, files in os.walk(base_dir):
+            # 跳过隐藏目录和非笔记目录
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for f in files:
+                if f.endswith(".md"):
+                    path = os.path.join(current, f)
+                    rel = os.path.relpath(path, root)
+                    try:
+                        manifest[rel] = file_hash(path)
+                    except Exception:
+                        continue
     return manifest
 
 
@@ -127,8 +138,8 @@ def build(full: bool = False):
     只对新增/修改过的文件重新 embed，未变化的文件跳过。
     传 full=True（或 CLI 加 --full）可强制全量重建。
     """
-    print(f"📂 扫描 {SECONDBRAIN_DIR} ...")
-    new_manifest = scan_files(SECONDBRAIN_DIR)
+    print(f"📂 扫描 {', '.join(SECONDBRAIN_DIRS)} ...")
+    new_manifest = scan_files(SECONDBRAIN_DIRS, SECONDBRAIN_ROOT)
     old_manifest = {} if full else load_manifest()
 
     client = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -166,7 +177,7 @@ def build(full: bool = False):
     if changed:
         all_chunks = []
         for rel in changed:
-            all_chunks.extend(load_file_chunks(SECONDBRAIN_DIR, rel))
+            all_chunks.extend(load_file_chunks(SECONDBRAIN_ROOT, rel))
         print(f"📄 {len(all_chunks)} 个新/改动 chunks 待嵌入")
 
         for i in range(0, len(all_chunks), BATCH_SIZE):

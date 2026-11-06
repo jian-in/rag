@@ -35,6 +35,9 @@ class ConversationMemory:
       - 滑动窗口 + 摘要压缩是平衡方案
     """
 
+    # LLM 压缩失败时，截断式摘要保留的最大字符数（保留最新的部分）
+    FALLBACK_SUMMARY_CHARS = 1500
+
     def __init__(
         self,
         max_turns: int = 10,
@@ -63,10 +66,16 @@ class ConversationMemory:
         """
         添加一轮对话
 
+        窗口已满时先把较早的对话压缩进摘要，再追加本轮。history 是
+        ``deque(maxlen=max_turns)``，否则第 max_turns+1 轮会把最早一轮直接挤掉，
+        既不进摘要也没有提示（/api/ask 路径此前从不压缩，正是这样丢上下文的）。
+
         Args:
             user_message: 用户消息
             assistant_message: 助手回复
         """
+        if self.max_turns and len(self.history) >= self.max_turns:
+            self.compress_old_turns(keep_recent=max(1, self.max_turns // 2))
         self.history.append({
             "user": user_message,
             "assistant": assistant_message,
@@ -189,7 +198,12 @@ class ConversationMemory:
             self.history = deque(recent_turns, maxlen=self.max_turns)
             print(f"Compressed {len(old_turns)} old turns into summary")
         except Exception as exc:
-            print(f"⚠️ 压缩对话历史失败，保留现有历史: {exc}")
+            # LLM 不可用时退化为截断式摘要：旧对话原文折叠进 summary，
+            # 让窗口腾出空间，避免下一轮 append 时被 deque 静默丢弃。
+            print(f"⚠️ 压缩对话历史失败，改用截断摘要: {exc}")
+            combined = f"{self.summary}\n{old_text}" if self.summary else old_text
+            self.summary = combined[-self.FALLBACK_SUMMARY_CHARS:]
+            self.history = deque(recent_turns, maxlen=self.max_turns)
 
     def clear(self):
         """清空对话历史"""

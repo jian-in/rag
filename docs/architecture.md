@@ -34,7 +34,7 @@
 
 **Chain 层**是 RAG 的核心编排模块。它接收检索结果，与精心设计的 Prompt 模板组合后送入 LLM，生成带有来源引用的答案。
 
-**Evaluation 层**基于 RAGAS 框架提供量化评估能力，支持 Faithfulness、Answer Relevancy、Context Precision 等核心指标的计算。
+**Evaluation 层**用项目配置的 LLM 做裁判（LLM-as-judge）提供量化评估能力，支持 Faithfulness、Answer Relevancy、Context Precision 等核心指标的计算。
 
 ## 关键设计决策
 
