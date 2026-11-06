@@ -397,6 +397,7 @@ def sync_vectorstore(
             report.errors.append(f"删除 {source}: {exc}")
             new_manifest[source] = old_hash
 
+    write_failed = False
     for source, (_source_hash, chunks, old_chunks) in pending.items():
         old_ids = [item["id"] for item in old_chunks]
         desired_ids = _chunk_ids(source, _source_hash, chunks)
@@ -414,15 +415,29 @@ def sync_vectorstore(
                 report.removed_chunks += len(remaining_old)
         except Exception as exc:
             report.errors.append(f"写入 {source}: {exc}")
+            write_failed = True
+            # 写入失败时不能记下新 hash：否则下次同步会因 hash 相同且旧 chunk
+            # 仍在而判为“未变化”，旧内容就永久留在索引里。回退到旧 hash
+            # （新增文件则不记录），保证下次同步重试。
+            previous_hash = old_manifest.get(source)
+            if previous_hash is None:
+                new_manifest.pop(source, None)
+            else:
+                new_manifest[source] = previous_hash
 
     final = _store_snapshot(vectorstore)
     report.doc_count = sum(len(items) for items in final.values())
     report.vector_count = vectorstore.count()
+    # 管线升级（force_reparse）途中有文件写入失败时保留旧签名，
+    # 否则失败文件会以旧管线的 chunk 被下次同步误判为已完成。
+    saved_signature = (
+        old_pipeline_signature if force_reparse and write_failed else pipeline_signature
+    )
     _save_json(
         manifest_path,
         {
             "version": 1,
-            "pipeline_signature": pipeline_signature,
+            "pipeline_signature": saved_signature,
             "files": new_manifest,
         },
     )

@@ -257,13 +257,23 @@ class KnowledgeRuntime:
     ) -> List[Any]:
         """Parent-window expansion: merge each hit with +/-window neighbouring chunks.
 
-        Overlapping windows from the same (source, page) are merged so the LLM
-        never sees duplicated content. Chunks without index metadata pass through.
+        Overlapping or touching windows from the same (source, page) are merged
+        (in either direction, regardless of hit order) so the LLM never sees
+        duplicated content and no hit is dropped. Each merged window keeps the
+        rank position and metadata of its best-ranked hit. Chunks without index
+        metadata pass through.
         """
         if window <= 0 or not docs:
             return docs
 
-        expanded: List[Any] = []
+        # Output slots in rank order: either a pass-through Document or a
+        # mutable window group {"key", "start", "end", "metadata", "alive"}.
+        slots: List[Any] = []
+        groups_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
+
+        def touches(group: Dict[str, Any], start: int, end: int) -> bool:
+            return start <= group["end"] + 1 and end >= group["start"] - 1
+
         for doc in docs:
             metadata = doc.metadata
             key = (metadata.get("source", ""), metadata.get("page", ""))
@@ -275,37 +285,67 @@ class KnowledgeRuntime:
             siblings = self._chunks_by_doc.get(key) if chunk_index is not None else None
 
             if not siblings:
-                expanded.append(doc)
+                slots.append(doc)
                 continue
 
             start = max(1, chunk_index - window)
             end = chunk_index + window
+            groups = groups_by_key.setdefault(key, [])
+            merged = next((group for group in groups if touches(group, start, end)), None)
+            if merged is None:
+                group = {
+                    "key": key,
+                    "start": start,
+                    "end": end,
+                    "metadata": metadata,
+                    "alive": True,
+                    "rank": len(slots),
+                }
+                groups.append(group)
+                slots.append(group)
+                continue
 
-            # Merge with the previous expanded doc if it covers the same file
-            # and the ranges touch (keeps output free of duplicated text).
-            if expanded:
-                prev = expanded[-1]
-                pm = prev.metadata
-                pkey = (pm.get("source", ""), pm.get("page", ""))
-                if pkey == key and pm.get("window_end") is not None and start <= pm["window_end"] + 1:
-                    if end > pm["window_end"]:
-                        psibs = self._chunks_by_doc.get(pkey, {})
-                        lo, hi = pm["window_end"] + 1, end
-                        extra = "\n\n".join(
-                            psibs[i].page_content for i in range(lo, hi + 1) if i in psibs
-                        )
-                        prev.page_content = prev.page_content + ("\n\n" + extra if extra else "")
-                        prev.metadata = {**pm, "window_end": end}
-                    continue
+            merged["start"] = min(merged["start"], start)
+            merged["end"] = max(merged["end"], end)
+            # The widened window may now bridge other groups of the same file;
+            # repeat until stable because each absorption widens it further.
+            absorbed = True
+            while absorbed:
+                absorbed = False
+                for other in groups:
+                    if other is merged or not other["alive"]:
+                        continue
+                    if touches(other, merged["start"], merged["end"]):
+                        start_, end_ = min(merged["start"], other["start"]), max(merged["end"], other["end"])
+                        # Keep the better-ranked group as the survivor so the
+                        # merged window stays at its best hit's position.
+                        survivor, loser = (other, merged) if other["rank"] < merged["rank"] else (merged, other)
+                        survivor["start"], survivor["end"] = start_, end_
+                        loser["alive"] = False
+                        merged = survivor
+                        absorbed = True
+            groups_by_key[key] = [group for group in groups if group["alive"]]
 
-            parts = [siblings[i].page_content for i in range(start, end + 1) if i in siblings]
+        expanded: List[Any] = []
+        for slot in slots:
+            if not isinstance(slot, dict):
+                expanded.append(slot)
+                continue
+            if not slot["alive"]:
+                continue
+            siblings = self._chunks_by_doc.get(slot["key"], {})
+            parts = [
+                siblings[i].page_content
+                for i in range(slot["start"], slot["end"] + 1)
+                if i in siblings
+            ]
             expanded.append(
                 Document(
                     page_content="\n\n".join(parts),
                     metadata={
-                        **metadata,
-                        "window_start": start,
-                        "window_end": end,
+                        **slot["metadata"],
+                        "window_start": slot["start"],
+                        "window_end": slot["end"],
                         "expanded": True,
                     },
                 )

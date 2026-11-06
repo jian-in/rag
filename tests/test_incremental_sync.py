@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,6 +63,19 @@ class FakeVectorStore:
 
     def count(self) -> int:
         return self._collection.count()
+
+
+class FailingVectorStore(FakeVectorStore):
+    """Vector store whose writes fail on demand, like an embedding API outage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_writes = False
+
+    def add_documents_with_ids(self, documents, ids) -> None:
+        if self.fail_writes:
+            raise RuntimeError("embedding API unavailable")
+        super().add_documents_with_ids(documents, ids)
 
 
 class IncrementalSyncTests(unittest.TestCase):
@@ -165,6 +179,71 @@ class IncrementalSyncTests(unittest.TestCase):
             )
             self.assertEqual(removed.removed_files, 1)
             self.assertEqual(store._collection.count(), 0)
+
+    def test_failed_write_is_retried_instead_of_marked_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            note = root / "note.md"
+            manifest = root / "manifest.json"
+            store = FailingVectorStore()
+            splitter = TextSplitter(chunk_size=100, chunk_overlap=10)
+
+            note.write_text("old content version one", encoding="utf-8")
+            sync_vectorstore(store, [note], DocumentLoader(), splitter, manifest)
+
+            note.write_text("new content version two", encoding="utf-8")
+            store.fail_writes = True
+            failed = sync_vectorstore(store, [note], DocumentLoader(), splitter, manifest)
+            self.assertEqual(len(failed.errors), 1)
+
+            store.fail_writes = False
+            retried = sync_vectorstore(store, [note], DocumentLoader(), splitter, manifest)
+
+            self.assertEqual(retried.errors, [])
+            self.assertEqual(retried.changed_files, 1)
+            self.assertEqual(retried.unchanged_files, 0)
+            contents = store.get_snapshot()["documents"]
+            self.assertEqual(contents, ["new content version two"])
+
+    def test_failed_write_of_new_file_is_not_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            note = root / "note.md"
+            manifest = root / "manifest.json"
+            store = FailingVectorStore()
+            store.fail_writes = True
+            note.write_text("brand new note", encoding="utf-8")
+
+            sync_vectorstore(
+                store,
+                [note],
+                DocumentLoader(),
+                TextSplitter(chunk_size=100, chunk_overlap=10),
+                manifest,
+            )
+
+            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertNotIn(str(note.resolve()), saved["files"])
+
+    def test_pipeline_upgrade_keeps_old_signature_when_a_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            note = root / "note.md"
+            manifest = root / "manifest.json"
+            store = FailingVectorStore()
+            note.write_text("stable content " * 20, encoding="utf-8")
+            sync_vectorstore(
+                store, [note], DocumentLoader(), TextSplitter(chunk_size=100, chunk_overlap=10), manifest
+            )
+            old_signature = json.loads(manifest.read_text(encoding="utf-8"))["pipeline_signature"]
+
+            store.fail_writes = True
+            sync_vectorstore(
+                store, [note], DocumentLoader(), TextSplitter(chunk_size=80, chunk_overlap=10), manifest
+            )
+
+            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(saved["pipeline_signature"], old_signature)
 
     def test_mcp_exposes_sync_tool(self) -> None:
         names = {tool["name"] for tool in MCPServer()._tool_definitions()}

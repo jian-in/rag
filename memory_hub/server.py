@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -14,6 +15,24 @@ from .core import MEMORY_SCOPES, RETRIEVAL_MODES, MemoryHub
 
 class MemoryMCPError(RuntimeError):
     pass
+
+
+# 允许的 Host 头主机名（含任意端口）。防 DNS Rebinding：攻击者把自己的域名
+# 解析到 127.0.0.1 后，浏览器发出的 Host 仍是攻击者域名。
+TRUSTED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+# 写操作必须是 JSON：text/plain、表单等 CORS 简单请求不触发预检，
+# 任何网页都能跨站发出；强制 application/json 后浏览器会先预检，而本服务不放行 CORS。
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _request_hostname(request: Request) -> str:
+    # Host 形如 "127.0.0.1:8771" 或 "[::1]:8771"，补上 "//" 才能按 netloc 解析
+    return (urlsplit("//" + request.headers.get("host", "")).hostname or "").lower()
+
+
+def _is_json_request(request: Request) -> bool:
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    return media_type == "application/json"
 
 
 class MemoryMCP:
@@ -172,11 +191,29 @@ class MemoryMCP:
         raise MemoryMCPError(f"unknown memory tool: {name}")
 
 
-def create_app(hub: MemoryHub) -> FastAPI:
+def create_app(
+    hub: MemoryHub,
+    *,
+    trusted_hostnames: frozenset[str] = TRUSTED_HOSTNAMES,
+) -> FastAPI:
     tools = MemoryMCP(hub)
     app = FastAPI(title="Feili Personal Memory Hub", version="0.3.0")
     static_root = Path(__file__).resolve().parent / "static"
     app.mount("/assets", StaticFiles(directory=static_root), name="memory-assets")
+
+    @app.middleware("http")
+    async def enforce_local_json_requests(request: Request, call_next):
+        if _request_hostname(request) not in trusted_hostnames:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "forbidden: untrusted Host header"},
+            )
+        if request.method in _BODY_METHODS and not _is_json_request(request):
+            return JSONResponse(
+                status_code=415,
+                content={"detail": "Content-Type must be application/json"},
+            )
+        return await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

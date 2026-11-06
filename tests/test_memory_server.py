@@ -77,7 +77,7 @@ class MemoryServerTests(unittest.TestCase):
                 )
             )
             hub.sync()
-            client = TestClient(create_app(hub))
+            client = TestClient(create_app(hub), base_url="http://127.0.0.1")
 
             health = client.get("/health")
             manifest = client.get("/.well-known/agent-memory.json")
@@ -160,7 +160,7 @@ class MemoryServerTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "unknown memory tool"):
                 mcp.call_tool("memory_approve", {"id": proposed["id"]})
 
-            client = TestClient(create_app(hub))
+            client = TestClient(create_app(hub), base_url="http://127.0.0.1")
             pending = client.get("/api/candidates", params={"status": "pending"})
             approved = client.post(
                 f"/api/candidates/{proposed['id']}/decision",
@@ -175,6 +175,51 @@ class MemoryServerTests(unittest.TestCase):
                 "可审计的自动化流程",
                 (memory / "USER_PROFILE.md").read_text(encoding="utf-8"),
             )
+
+    def test_rejects_untrusted_host_and_non_json_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hub = MemoryHub(
+                MemoryHubSettings(
+                    index_root=root / "indexes",
+                    vault_root=root / "vault",
+                    memory_root=root / "memory",
+                    rollout_root=root / "rollouts",
+                    vault_include_dirs=(),
+                )
+            )
+            app = create_app(hub)
+            proposal = '{"scope": "profile", "content": "planted by a web page"}'
+
+            # DNS rebinding: a foreign Host must not reach reads or writes.
+            rebinding = TestClient(app, base_url="http://evil.example:8771")
+            self.assertEqual(rebinding.get("/api/candidates").status_code, 403)
+            self.assertEqual(
+                rebinding.post("/api/search", json={"query": "偏好"}).status_code, 403
+            )
+
+            # Cross-site "simple" requests (text/plain, forms) skip CORS preflight.
+            local = TestClient(app, base_url="http://127.0.0.1:8771")
+            for content_type in ("text/plain", "application/x-www-form-urlencoded", None):
+                headers = {"Content-Type": content_type} if content_type else {}
+                response = local.post(
+                    "/api/candidates/propose", content=proposal, headers=headers
+                )
+                self.assertEqual(response.status_code, 415, content_type)
+            self.assertEqual(hub.review_memories(status="pending"), [])
+
+            # Loopback hosts with JSON bodies keep working, including IPv6 and charset.
+            accepted = local.post(
+                "/api/candidates/propose",
+                content=proposal,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            self.assertEqual(accepted.status_code, 200)
+            # Starlette's TestClient cannot parse an IPv6 base_url, so set Host directly.
+            for host in ("localhost:8771", "[::1]:8771", "127.0.0.1"):
+                self.assertEqual(
+                    local.get("/health", headers={"Host": host}).status_code, 200, host
+                )
 
 
 if __name__ == "__main__":
