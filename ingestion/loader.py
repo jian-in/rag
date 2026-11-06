@@ -120,14 +120,27 @@ class DocumentLoader:
         return docs
 
     def _read_file_text(self, path: Path) -> str:
-        """带编码降级与 BOM 容错的文本读取"""
-        try:
-            return path.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            try:
-                return path.read_text(encoding="gb18030")
-            except UnicodeDecodeError:
-                return path.read_text(encoding="utf-8", errors="replace")
+        """带编码降级与 BOM 容错的文本读取
+
+        顺序：按 BOM 识别 UTF-16（Windows 记事本的「Unicode」）→ UTF-8（含 BOM）
+        → GB18030（覆盖 GBK/GB2312）→ UTF-8 替换非法字节兜底。
+        """
+        raw = path.read_bytes()
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            # utf-16 编解码器会读取并去掉 BOM、自动判断字节序
+            text = raw.decode("utf-16", errors="replace")
+        else:
+            for encoding in ("utf-8-sig", "gb18030"):
+                try:
+                    text = raw.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                text = raw.decode("utf-8", errors="replace")
+        # bytes.decode 不做换行转换；与 read_text 的通用换行行为保持一致，
+        # 否则 CRLF 文件的 "\r\n\r\n" 匹配不上分块分隔符 "\n\n"。
+        return text.replace("\r\n", "\n").replace("\r", "\n")
 
     def _load_text(self, path: Path, base_metadata: dict) -> List[Document]:
         """加载纯文本文件"""

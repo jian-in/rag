@@ -290,12 +290,21 @@ def _chunk_ids(source: str, source_hash: str, chunks: Sequence[Document]) -> Lis
 
 
 def _pipeline_signature(splitter: TextSplitter) -> str:
+    """Everything that changes how a file becomes chunks/vectors.
+
+    A different signature forces every file to be re-split on the next sync, so
+    the index never mixes chunks produced by old and new rules. Separators were
+    missing here: changing them left unchanged notes on the old chunking.
+    """
+    separators = getattr(splitter, "separators", None)
     return "|".join(
         (
             "incremental-sync-v1",
             splitter.__class__.__name__,
             f"chunk_size={getattr(splitter, 'chunk_size', '')}",
             f"chunk_overlap={getattr(splitter, 'chunk_overlap', '')}",
+            f"separators={json.dumps(list(separators), ensure_ascii=False) if separators is not None else ''}",
+            f"keep_separator={getattr(splitter, 'keep_separator', '')}",
             f"embedding={config.EMBEDDING_MODEL_NAME}",
             f"dimension={config.EMBEDDING_DIMENSION}",
         )

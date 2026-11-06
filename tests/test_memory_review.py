@@ -166,7 +166,9 @@ class MemoryReviewTests(unittest.TestCase):
             approved = hub.review_memory(str(candidate["id"]), "approve")
 
             expected = root / "SecondBrain" / "00-Inbox" / "Agent Memory Inbox.md"
-            self.assertEqual(Path(str(approved["target_path"])), expected)
+            # target_path is stored resolved; resolve the expectation too so an
+            # 8.3 short temp path (C:\Users\RUNNER~1 on CI) compares equal.
+            self.assertEqual(Path(str(approved["target_path"])), expected.resolve())
             self.assertTrue(expected.is_file())
             self.assertTrue(hub.search("琥珀风铃", scopes=("vault",), top_k=3))
             self.assertFalse(hub.search("灰色鲸落", scopes=("vault",), top_k=3))

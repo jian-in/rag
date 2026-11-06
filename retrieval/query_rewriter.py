@@ -23,6 +23,33 @@ from langchain_core.prompts import ChatPromptTemplate
 import config
 
 
+REWRITE_STRATEGIES = ("expand", "decompose", "hyde")
+
+# LLM 输出子问题时常带的列表前缀。只认明确的编号/符号，不吞正文：
+#   "1. " "1." "1、" "1)" "1）" "(1)" "（1）" "一、" "- " "* " "•"
+#   但 "1.5倍…"（小数）、"3 个场景…"、"2024年…"、"-1 的意义" 保持不变。
+_LIST_MARKER_RE = re.compile(
+    r"^(?:"
+    r"[(（]\d{1,3}[)）]"
+    r"|\d{1,3}(?:[.．](?!\d)|[、)）])"
+    r"|[一二三四五六七八九十]{1,3}[、.．]"
+    r"|[-*]\s+"
+    r"|[•·]"
+    r")\s*"
+)
+
+
+def strip_list_marker(line: str) -> str:
+    """去掉一行开头的列表编号或项目符号（支持 "- 1. xxx" 这类嵌套前缀）。"""
+    cleaned = line.strip()
+    for _ in range(2):
+        stripped = _LIST_MARKER_RE.sub("", cleaned, count=1).strip()
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    return cleaned
+
+
 # ============================================================
 # 改写 Prompt 模板
 # ============================================================
@@ -128,10 +155,7 @@ class QueryRewriter:
         # 按行分割，过滤空行并清洗常见的 1. / 2、/ - / * 等前缀
         sub_queries = []
         for line in response.content.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            cleaned = re.sub(r"^(?:[0-9]+[.\、\)\s]+|[-*•]\s*)", "", line).strip()
+            cleaned = strip_list_marker(line)
             if cleaned:
                 sub_queries.append(cleaned)
 
@@ -177,24 +201,24 @@ class QueryRewriter:
             List[str]: 改写后的查询列表
                       （expand/hyde 返回1个，decompose 可能返回多个）
         """
+        # 策略名错误是调用方的 bug，必须显式报错；只有 LLM 调用失败才降级。
+        if strategy not in REWRITE_STRATEGIES:
+            raise ValueError(f"不支持的改写策略: {strategy}")
+
         try:
             if strategy == "expand":
                 rewritten = self.expand(query)
                 print(f"🔄 查询改写(expand): '{query}' → '{rewritten}'")
                 return [rewritten] if rewritten else [query]
 
-            elif strategy == "decompose":
+            if strategy == "decompose":
                 sub_queries = self.decompose(query)
                 print(f"🔄 查询改写(decompose): '{query}' → {sub_queries}")
                 return sub_queries if sub_queries else [query]
 
-            elif strategy == "hyde":
-                hypothetical = self.hyde(query)
-                print(f"🔄 查询改写(hyde): 生成了假设性文档")
-                return [hypothetical] if hypothetical else [query]
-
-            else:
-                raise ValueError(f"不支持的改写策略: {strategy}")
+            hypothetical = self.hyde(query)
+            print(f"🔄 查询改写(hyde): 生成了假设性文档")
+            return [hypothetical] if hypothetical else [query]
         except Exception as exc:
             print(f"⚠️ 查询改写失败，降级回退到原始查询: {exc}")
             return [query]

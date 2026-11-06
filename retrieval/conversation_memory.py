@@ -131,9 +131,17 @@ class ConversationMemory:
 
         history_text = self.get_context()
         messages = prompt.format_messages(history=history_text, query=current_query)
-        response = self.llm.invoke(messages)
+        # 改写只是锦上添花：LLM 超时/限流时用原问题继续检索，
+        # 而不是让整次问答失败（与 QueryRewriter.rewrite 的降级策略一致）。
+        try:
+            response = self.llm.invoke(messages)
+            rewritten = (response.content or "").strip()
+        except Exception as exc:
+            print(f"⚠️ 结合历史改写失败，使用原问题: {exc}")
+            return current_query
+        if not rewritten:
+            return current_query
 
-        rewritten = response.content.strip()
         if rewritten != current_query:
             print(f"Rewrite: '{current_query}' -> '{rewritten}'")
 

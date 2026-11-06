@@ -29,6 +29,10 @@ class TextSplitter:
     这种策略能最大程度保留语义完整性。
     """
 
+    # 段落 → 行 → 中英文句末标点 → 空格 → 字符；句末标点保留在前一块末尾
+    SEPARATORS = ("\n\n", "\n", "。", "！", "？", "；", ". ", "! ", "? ", "; ", " ", "")
+    KEEP_SEPARATOR = "end"
+
     def __init__(
         self,
         chunk_size: int = config.CHUNK_SIZE,
@@ -41,13 +45,17 @@ class TextSplitter:
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        # 分块规则会进入增量同步的管线签名（incremental_sync._pipeline_signature）：
+        # 修改这里会让下次同步重新切分全部文件，避免新旧规则的 chunk 混在同一索引里。
+        self.separators = list(self.SEPARATORS)
+        self.keep_separator = self.KEEP_SEPARATOR
 
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             length_function=len,
-            separators=["\n\n", "\n", "。", "！", "？", "；", ". ", "! ", "? ", "; ", " ", ""],
-            keep_separator="end",
+            separators=self.separators,
+            keep_separator=self.keep_separator,
             is_separator_regex=False,
         )
 
